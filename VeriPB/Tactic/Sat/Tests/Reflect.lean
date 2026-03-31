@@ -19,4 +19,18 @@ veripb_reflect php21_reflect
   "VeriPB/Tactic/Sat/Tests/data/php21.opb"
   "VeriPB/Tactic/Sat/Tests/data/php21_kernel.pbp"
 
+-- Red subproof test: pigeon-hole variant with redundance-based strengthening.
+-- Uses red/dom with explicit subproof (proofgoal #1 and proofgoal 1).
+-- Tests: red rule, substitution parsing, goal verification, auto-satisfaction.
+-- From VeriPB test suite: redundance_explicit_subproof.
+veripb_reflect red_subproof_reflect
+  "VeriPB/Tactic/Sat/Tests/data/red_subproof.opb"
+  "VeriPB/Tactic/Sat/Tests/data/red_subproof_kernel.pbp"
+
+-- Red variable swap test: symmetric formula with x1↔x2 swap.
+-- Tests: auto-satisfied coverage (all constraints map to each other under swap).
+veripb_reflect red_swap_reflect
+  "VeriPB/Tactic/Sat/Tests/data/red_swap.opb"
+  "VeriPB/Tactic/Sat/Tests/data/red_swap_kernel.pbp"
+
 end VeriPB.Tests.Reflect

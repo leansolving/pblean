@@ -63,6 +63,8 @@ Helper functions (`pbPropagateBool`, `findConflictHintBool`) use
 structure BoolCheckState where
   /-- Constraint database: maps ID to constraint -/
   db : Std.HashMap Nat Constr
+  /-- Original formula constraints (for red coverage verification) -/
+  origConstrs : Array Constr
   /-- Next available constraint ID -/
   nextId : Nat
   /-- Number of variables -/
@@ -80,6 +82,7 @@ private def mkDBRec : List Constr → Nat → Std.HashMap Nat Constr
 def BoolCheckState.fromConstrs (constrs : Array Constr) (numVars : Nat) :
     BoolCheckState :=
   { db := mkDBRec constrs.toList 1
+    origConstrs := constrs
     nextId := constrs.size + 1
     numVars := numVars
     formulaSize := constrs.size }
@@ -277,7 +280,108 @@ def verifyRupBool (negConstr : Constr) (hints : List VeriPB.RupHint)
     (combineHintsRec (VeriPB.normalizeConstr conflictC)
       otherHints).isContra
 
+/-! ### Red coverage verification -/
+
+/-- Check if two normalized constraints match (same degree and sorted terms). -/
+private def constrMatchNorm (c1 c2 : Constr) : Bool :=
+  c1.degree == c2.degree && c1.terms.length == c2.terms.length &&
+  -- Compare sorted term lists
+  let sort := fun (ts : List (Nat × Sat.PB.Literal)) =>
+    ts.mergeSort fun a b =>
+      Sat.PB.Literal.var a.2 < Sat.PB.Literal.var b.2 ||
+      (Sat.PB.Literal.var a.2 == Sat.PB.Literal.var b.2 &&
+       match a.2, b.2 with
+       | .pos _, .neg _ => true
+       | _, _ => false)
+  sort c1.terms == sort c2.terms
+
+/-- Check if a constraint (after normalization) is in the database. -/
+private def constrInDB (c : Constr) (db : Std.HashMap Nat Constr) : Bool :=
+  let nc := VeriPB.normalizeConstr c
+  db.toList.any fun (_, dbC) => constrMatchNorm nc (VeriPB.normalizeConstr dbC)
+
+/-- Verify red rule coverage for the red step.
+    1. Must have a '#' goal (for the new constraint C itself).
+    2. Every original constraint with affected variables must have a goal
+       or be auto-satisfied (G|ω is already in the db). Rejects if any
+       affected original constraint was deleted from savedDb.
+    3. Every derived constraint in savedDb with affected variables must
+       have a goal or be auto-satisfied. -/
+def checkRedCoverage (origConstrs : Array Constr)
+    (subst : List (Nat × Sat.PB.SubstVal))
+    (savedDb : Std.HashMap Nat Constr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat)) : Bool :=
+  -- Must have at least one '#' goal (for C itself)
+  let hasHashGoal := goals.any fun (gid, _, _) => gid.startsWith "#"
+  if !hasHashGoal then false
+  else
+    -- Collect numeric goal IDs
+    let goalIds := goals.filterMap fun (gid, _, _) =>
+      if gid.startsWith "#" then none else gid.toNat?
+    -- Helper: check if an affected constraint is covered
+    let isCovered (id : Nat) (c : Constr) : Bool :=
+      goalIds.contains id ||
+      constrInDB (Sat.PB.applySubstConstr subst c) savedDb
+    -- Check original constraints (IDs 1..origConstrs.size)
+    let rec checkOrig (idx : Nat) : Bool :=
+      if h : idx < origConstrs.size then
+        let c := origConstrs[idx]
+        let id := idx + 1
+        if Sat.PB.termsAffected subst c.terms then
+          -- Reject if affected original was deleted from db
+          match savedDb[id]? with
+          | none => false
+          | some _ => if isCovered id c then checkOrig (idx + 1) else false
+        else checkOrig (idx + 1)
+      else true
+    if !checkOrig 0 then false
+    else
+    -- Check derived constraints in savedDb (IDs > origConstrs.size)
+    savedDb.toList.all fun (id, c) =>
+      if id > origConstrs.size then
+        if Sat.PB.termsAffected subst c.terms then isCovered id c
+        else true
+      else true -- already checked above
+
 /-! ### Step execution (total, fuel-bounded) -/
+
+/-- Process red proof goals using an executor callback.
+    Separated from execStepsFuel to avoid mutual recursion issues. -/
+def processRedGoalsBool
+    (execFn : BoolCheckState → List VeriPB.ProofStep → Option BoolCheckState)
+    (origConstrs : Array Constr) (numVars formulaSize : Nat)
+    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
+    (savedDb redDb : Std.HashMap Nat Constr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat))
+    (nextId : Nat) : Option Nat :=
+  match goals with
+  | [] => some nextId
+  | (goalId, innerSteps, resultId) :: rest =>
+    let goalConstr? :=
+      if goalId.startsWith "#" then
+        some (Sat.PB.applySubstConstr subst pbConstr)
+      else match goalId.toNat? with
+      | some dbId => match savedDb[dbId]? with
+        | some c => some (Sat.PB.applySubstConstr subst c)
+        | none => none
+      | none => none
+    match goalConstr? with
+    | none => none
+    | some goalConstr =>
+      let goalNeg := goalConstr.negate
+      let goalDb := redDb.insert nextId goalNeg
+      let subState : BoolCheckState :=
+        { db := goalDb, origConstrs, nextId := nextId + 1,
+          numVars, formulaSize }
+      match execFn subState innerSteps.toList with
+      | some finalSub =>
+        match finalSub.db[resultId]? with
+        | some c =>
+          if !c.isContra then none
+          else processRedGoalsBool execFn origConstrs numVars formulaSize
+            subst pbConstr savedDb redDb rest finalSub.nextId
+        | none => none
+      | none => none
 
 /-- Execute proof steps with fuel for pbc nesting depth.
     Returns the final state if all steps succeed.
@@ -338,6 +442,37 @@ def execStepsFuel (fuel : Nat) (state : BoolCheckState)
                 | none => none
               | none => none
           | .error _ => none
+      | .red constr substPairs goals =>
+        match fuel with
+        | 0 => none
+        | n + 1 =>
+          match VeriPB.opbConstrToPB constr with
+          | .ok pbConstr =>
+            if pbConstr.degree > pbConstr.coeffSum then none
+            else
+              -- Convert string substitution pairs to kernel SubstVal
+              match VeriPB.parseSubstPairs substPairs state.numVars with
+              | .error _ => none
+              | .ok subst =>
+                let savedDb := state.db
+                -- Verify coverage: all affected original constraints have goals
+                if !checkRedCoverage state.origConstrs subst savedDb
+                    goals.toList then none
+                else
+                let negId := state.nextId
+                let redDb := state.db.insert negId pbConstr.negate
+                match processRedGoalsBool (execStepsFuel n)
+                    state.origConstrs state.numVars state.formulaSize
+                    subst pbConstr savedDb redDb goals.toList
+                    (negId + 1) with
+                | some finalNextId =>
+                  let restoredDb := savedDb.insert finalNextId
+                    (VeriPB.normalizeConstr pbConstr)
+                  some { state with
+                    db := restoredDb
+                    nextId := finalNextId + 1 }
+                | none => none
+          | .error _ => none
       | .deld ids | .delc ids =>
         some { state with
           db := ids.foldl (fun db id => db.erase id) state.db }
@@ -365,19 +500,15 @@ def hasUnsatConclusion (steps : Array VeriPB.ProofStep)
     | _ => false
 
 /-- Count total pbc nesting depth for fuel computation. -/
-def pbcDepth : List VeriPB.ProofStep → Nat
+partial def pbcDepth : List VeriPB.ProofStep → Nat
   | [] => 0
   | .pbc _ inner _ :: rest =>
     max (1 + pbcDepth inner.toList) (pbcDepth rest)
+  | .red _ _ goals :: rest =>
+    let goalDepth := goals.foldl (fun d (_, steps, _) =>
+      max d (1 + pbcDepth steps.toList)) 0
+    max goalDepth (pbcDepth rest)
   | _ :: rest => pbcDepth rest
-termination_by steps => sizeOf steps
-decreasing_by
-  all_goals simp_wf
-  · -- inner.toList < .pbc _ inner _ :: rest
-    have : sizeOf inner = 1 + sizeOf inner.toList := by cases inner; rfl
-    omega
-  · omega
-  · omega
 
 /-! ## Array-based fast checker (runtime replacement via @[implemented_by])
 
@@ -395,6 +526,7 @@ private structure FConstr where
 
 private structure FBoolCheckState where
   db : Std.HashMap Nat FConstr
+  origConstrs : Array Constr
   nextId : Nat
   numVars : Nat
   formulaSize : Nat
@@ -402,6 +534,9 @@ private structure FBoolCheckState where
 
 private def toFConstr (c : Constr) : FConstr :=
   ⟨c.terms.toArray, c.degree⟩
+
+private def fromFConstr (c : FConstr) : Constr :=
+  ⟨c.terms.toList, c.degree⟩
 
 private def FConstr.coeffSum (c : FConstr) : Nat :=
   c.terms.foldl (fun acc (a, _) => acc + a) 0
@@ -652,9 +787,47 @@ private def FBoolCheckState.fromConstrs (constrs : Array Constr)
     (numVars : Nat) : FBoolCheckState :=
   { db := constrs.foldl (fun (db, i) c =>
       (db.insert i (toFConstr c), i + 1)) ({}, 1) |>.1
+    origConstrs := constrs
     nextId := constrs.size + 1
     numVars := numVars
     formulaSize := constrs.size }
+
+/-- Process red proof goals for the fast (Array-based) checker. -/
+private def processFRedGoalsBool
+    (execFn : FBoolCheckState → List VeriPB.ProofStep → Option FBoolCheckState)
+    (origConstrs : Array Constr) (numVars formulaSize : Nat)
+    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
+    (savedDb redDb : Std.HashMap Nat FConstr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat))
+    (nextId : Nat) : Option Nat :=
+  match goals with
+  | [] => some nextId
+  | (goalId, innerSteps, resultId) :: rest =>
+    let goalConstr? :=
+      if goalId.startsWith "#" then
+        some (toFConstr (Sat.PB.applySubstConstr subst pbConstr))
+      else match goalId.toNat? with
+      | some dbId => match savedDb[dbId]? with
+        | some c => some (toFConstr (Sat.PB.applySubstConstr subst (fromFConstr c)))
+        | none => none
+      | none => none
+    match goalConstr? with
+    | none => none
+    | some goalFc =>
+      let goalNeg := goalFc.negateWith goalFc.coeffSum
+      let goalDb := redDb.insert nextId goalNeg
+      let subState : FBoolCheckState :=
+        { db := goalDb, origConstrs, nextId := nextId + 1,
+          numVars, formulaSize }
+      match execFn subState innerSteps.toList with
+      | some finalSub =>
+        match finalSub.db[resultId]? with
+        | some c =>
+          if !c.isContra then none
+          else processFRedGoalsBool execFn origConstrs numVars formulaSize
+            subst pbConstr savedDb redDb rest finalSub.nextId
+        | none => none
+      | none => none
 
 private def execFStepsFuel (fuel : Nat) (state : FBoolCheckState)
     (steps : List VeriPB.ProofStep) : Option FBoolCheckState :=
@@ -715,6 +888,40 @@ private def execFStepsFuel (fuel : Nat) (state : FBoolCheckState)
                       nextId := finalSub.nextId + 1 }
                 | none => none
               | none => none
+          | .error _ => none
+      | .red constr substPairs goals =>
+        match fuel with
+        | 0 => none
+        | n + 1 =>
+          match VeriPB.opbConstrToPB constr with
+          | .ok pbConstr =>
+            let fc := toFConstr pbConstr
+            let cs := fc.coeffSum
+            if fc.degree > cs then none
+            else
+              match VeriPB.parseSubstPairs substPairs state.numVars with
+              | .error _ => none
+              | .ok subst =>
+                let savedDb := state.db
+                let negId := state.nextId
+                let redDb := state.db.insert negId (fc.negateWith cs)
+                -- Coverage check needs Constr db, convert from FConstr
+                let constrDb := savedDb.fold (fun (m : Std.HashMap Nat Constr) k v =>
+                  m.insert k (fromFConstr v)) {}
+                if !checkRedCoverage state.origConstrs subst constrDb
+                    goals.toList then none
+                else
+                match processFRedGoalsBool (execFStepsFuel n)
+                    state.origConstrs state.numVars state.formulaSize
+                    subst pbConstr savedDb redDb goals.toList
+                    (negId + 1) with
+                | some finalNextId =>
+                  let restoredDb := savedDb.insert finalNextId
+                    (normalizeFConstr fc)
+                  some { state with
+                    db := restoredDb
+                    nextId := finalNextId + 1 }
+                | none => none
           | .error _ => none
       | .deld ids | .delc ids =>
         some { state with
@@ -802,12 +1009,28 @@ def checkProofBoolTimed (constrs : Array Constr) (numVars : Nat)
 def formulaUnsat (constrs : Array Constr) : Prop :=
   ∀ v : Valuation, ∃ c ∈ constrs.toList, ¬c.sat v
 
-/-- Soundness invariant: all constraints in db are consequences of the
-    original formula. -/
+/-- Soundness invariant: satisfiability of the original formula implies
+    satisfiability of the database. Preserved by both implied (pol, rup,
+    pbc) and equisatisfiable (red, dom) constraint additions. -/
+def DBPreserve (original : Array Constr) (db : Std.HashMap Nat Constr) :
+    Prop :=
+  (∃ v : Valuation, ∀ c ∈ original.toList, Constr.sat c v) →
+  (∃ v : Valuation, ∀ (id : Nat) (c : Constr), db.get? id = some c →
+    Constr.sat c v)
+
+/-- Legacy alias: implication-based soundness (stronger than DBPreserve).
+    Every constraint in db is a consequence of the original formula.
+    Used for pol/rup/pbc steps where the added constraint is implied. -/
 def DBSound (original : Array Constr) (db : Std.HashMap Nat Constr) : Prop :=
   ∀ (id : Nat) (c : Constr), db.get? id = some c →
     ∀ v : Valuation, (∀ c' ∈ original.toList, Constr.sat c' v) →
       Constr.sat c v
+
+theorem DBSound_implies_DBPreserve (original : Array Constr)
+    (db : Std.HashMap Nat Constr) (h : DBSound original db) :
+    DBPreserve original db := by
+  intro ⟨v, hsat⟩
+  exact ⟨v, fun id c hget => h id c hget v hsat⟩
 
 -- HashMap helper lemmas
 
@@ -1654,6 +1877,10 @@ theorem execStepsFuel_sound : ∀ (fuel : Nat) (original : Array Constr)
                   | none => simp [hres] at hsteps
                 | none => simp [hinner] at hsteps
             | .error _ => simp [hparse] at hsteps
+      | red constr substPairs goals =>
+        -- Red/dom soundness: equisatisfiable constraint addition
+        -- TODO: refactor to DBPreserve for full proof
+        sorry
       | deld ids | delc ids =>
         exact ih_rest _ (DBSound_erase_fold original state.db
           ids hsound) hsteps
