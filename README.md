@@ -21,7 +21,7 @@ Two verification paths are available. The **metaprogram path** (`veripb_proof`) 
 
 ## Supported VeriPB rules
 
-`pol` (polynomial arithmetic), `rup` (reverse unit propagation), `pbc`/`subproof`/`qed` (proof by contradiction), `deld`/`delc` (deletion), `sol`/`soli` (solution), `f` (formula size), `output`, `conclusion UNSAT/SAT/BOUNDS`.
+`pol` (polynomial arithmetic), `rup` (reverse unit propagation), `pbc`/`subproof`/`qed` (proof by contradiction), `red`/`dom` (redundance and dominance-based strengthening), `deld`/`delc` (deletion), `sol`/`soli` (solution), `f` (formula size), `output`, `conclusion UNSAT/SAT/BOUNDS`.
 
 ## Application modules
 
@@ -77,6 +77,17 @@ theorem ramsey_3_3 : ramseyNumber 5
 ```lean
 -- EquitableColoring namespace
 theorem k331_eq_chromatic : equitableChromaticNumber k331 5
+```
+
+**Pigeonhole principle** (`Tests/Reflect.lean`, `applications/php/`) — PHP(3,2) is unsatisfiable. Exercises the `red` rule for symmetry breaking via a cyclic substitution witness.
+```lean
+theorem php32_red_reflect : formulaUnsat
+```
+
+**Bin packing** (`BinPacking.lean`) — 12 items of sizes [10,9,8,8,6,5,4,4,4,4,4,4] do not fit into 5 bins of capacity 14. The total size equals 5×14 = 70 (not refutable by weight alone); unsatisfiability follows from a rounding argument on the capacity constraints.
+```lean
+-- BinPacking namespace
+theorem bp12_5_impossible : ¬hasPacking inst12_5
 ```
 
 **Predicate convention:** Each predicate `fooNumber n` asserts that `n` is the largest value for which the feasibility condition holds. For example, `ramseyNumber 5` means K₅ admits a Ramsey-free 2-coloring but K₆ does not, hence R(3,3) = 6.

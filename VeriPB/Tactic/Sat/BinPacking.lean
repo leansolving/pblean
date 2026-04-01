@@ -23,8 +23,8 @@ such that the total size in each bin is at most C.
 
 ## Main results
 
-* `BinPacking.bp21_20_impossible` -- 21 items of sizes 21..41 do not
-  fit into 20 bins of capacity 40
+* `BinPacking.bp12_5_impossible` -- 12 items of sizes [10,9,8,8,6,5,4,4,4,4,4,4]
+  do not fit into 5 bins of capacity 14
 
 ## Infrastructure
 
@@ -413,16 +413,19 @@ elab "binpack_reflect " nm:ident ppSpace instTerm:term:max ppSpace proofFile:str
 
 -- Concrete instance
 
-/-- 21 items (sizes 21..40 plus one extra of size 21), 20 bins, capacity 40.
-    Every item fits individually (max size 40 = capacity), but no two
-    items share a bin (min pair 21+21 = 42 > 40). -/
-def inst21_20 : Instance :=
-  { sizes := (List.range 20 |>.map (· + 21)) ++ [21]
-    numBins := 20
-    capacity := 40 }
+/-- 12 items (sizes [10,9,8,8,6,5,4,4,4,4,4,4]), 5 bins, capacity 14.
+    Total size = 70 = 5×14, so not refutable by total weight alone.
+    UNSAT via rounding: with m=4, heavy items (≥8) need 2 slots,
+    light items (≥4) need 1 slot, each bin has ≤3 slots (14/4=3),
+    but total demand is 2×4+8=16 > 15=3×5. Not AMO-reducible:
+    pairs like 10+4=14 and triples like 4+4+4=12 fit. -/
+def inst12_5 : Instance :=
+  { sizes := [10, 9, 8, 8, 6, 5, 4, 4, 4, 4, 4, 4]
+    numBins := 5
+    capacity := 14 }
 
 -- Impossibility verified via VeriPB reflection checker
-binpack_reflect bp21_20_impossible inst21_20
-  "applications/binpack/bp21_20_kernel.pbp"
+binpack_reflect bp12_5_impossible inst12_5
+  "applications/binpack/bp12_5_kernel.pbp"
 
 end BinPacking
