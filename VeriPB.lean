@@ -13,6 +13,7 @@ import VeriPB.Tactic.Sat.Schur
 import VeriPB.Tactic.Sat.VanDerWaerden
 import VeriPB.Tactic.Sat.Ramsey
 import VeriPB.Tactic.Sat.EquitableColoring
+import VeriPB.Tactic.Sat.BinPacking
 
 /-!
 # VeriPB: Verified Pseudo-Boolean Proof Checking
