@@ -33,4 +33,21 @@ veripb_reflect red_swap_reflect
   "VeriPB/Tactic/Sat/Tests/data/red_swap.opb"
   "VeriPB/Tactic/Sat/Tests/data/red_swap_kernel.pbp"
 
+-- Red with constant substitution (x1 → 0): all 4 constraints affected,
+-- 3 have trivially-contra goal negates, 2 need real subproofs.
+veripb_reflect red_const_reflect
+  "VeriPB/Tactic/Sat/Tests/data/red_const.opb"
+  "VeriPB/Tactic/Sat/Tests/data/red_const_kernel.pbp"
+
+-- Red with negated literal substitution (x1 → ~x2, x2 → ~x1):
+-- complementary swap where all constraints auto-satisfy.
+veripb_reflect red_neglit_reflect
+  "VeriPB/Tactic/Sat/Tests/data/red_neglit.opb"
+  "VeriPB/Tactic/Sat/Tests/data/red_neglit_kernel.pbp"
+
+-- Dom keyword (identical semantics to red, different keyword).
+veripb_reflect dom_basic_reflect
+  "VeriPB/Tactic/Sat/Tests/data/dom_basic.opb"
+  "VeriPB/Tactic/Sat/Tests/data/dom_basic_kernel.pbp"
+
 end VeriPB.Tests.Reflect
