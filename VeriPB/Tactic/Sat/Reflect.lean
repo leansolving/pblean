@@ -999,15 +999,6 @@ def checkProofBoolTimed (constrs : Array Constr) (numVars : Nat)
 def formulaUnsat (constrs : Array Constr) : Prop :=
   ∀ v : Valuation, ∃ c ∈ constrs.toList, ¬c.sat v
 
-/-- Soundness invariant: satisfiability of the original formula implies
-    satisfiability of the database. Preserved by both implied (pol, rup,
-    pbc) and equisatisfiable (red, dom) constraint additions. -/
-def DBPreserve (original : Array Constr) (db : Std.HashMap Nat Constr) :
-    Prop :=
-  (∃ v : Valuation, ∀ c ∈ original.toList, Constr.sat c v) →
-  (∃ v : Valuation, ∀ (id : Nat) (c : Constr), db.get? id = some c →
-    Constr.sat c v)
-
 /-- Legacy alias: implication-based soundness (stronger than DBPreserve).
     Every constraint in db is a consequence of the original formula.
     Used for pol/rup/pbc steps where the added constraint is implied. -/
@@ -1016,24 +1007,12 @@ def DBSound (original : Array Constr) (db : Std.HashMap Nat Constr) : Prop :=
     ∀ v : Valuation, (∀ c' ∈ original.toList, Constr.sat c' v) →
       Constr.sat c v
 
-theorem DBSound_implies_DBPreserve (original : Array Constr)
-    (db : Std.HashMap Nat Constr) (h : DBSound original db) :
-    DBPreserve original db := by
-  intro ⟨v, hsat⟩
-  exact ⟨v, fun id c hget => h id c hget v hsat⟩
-
 /-- DB satisfiability: there exists a valuation satisfying all DB entries.
     Weaker than DBSound (no formula reference). Preserved by all proof steps
     including red/dom. -/
 def DBSat (db : Std.HashMap Nat Constr) : Prop :=
   ∃ v : Valuation, ∀ (id : Nat) (c : Constr), db.get? id = some c →
     Constr.sat c v
-
-theorem DBSound_implies_DBSat (original : Array Constr)
-    (db : Std.HashMap Nat Constr) (h : DBSound original db)
-    (hsat : ∃ v, ∀ c ∈ original.toList, Constr.sat c v) :
-    DBSat db :=
-  let ⟨v, hv⟩ := hsat; ⟨v, fun id c hget => h id c hget v hv⟩
 
 /-- Bridge: construct a synthetic DBSound from a HashMap by using its
     toList values as the "formula". This lets us reuse existing pol/rup
@@ -1076,19 +1055,6 @@ theorem DBSat_erase_fold (db : Std.HashMap Nat Constr) (ids : List Nat)
   | nil => exact hsat
   | cons id rest ih => exact ih (db.erase id) (DBSat_erase db id hsat)
 
-/-- Original DB entries match origConstrs. Preserved by all operations
-    since inserts only go to nextId > origConstrs.size. -/
-def OrigAgreement (origConstrs : Array Constr) (db : Std.HashMap Nat Constr) :
-    Prop :=
-  ∀ idx (h : idx < origConstrs.size),
-    ∀ c, db.get? (idx + 1) = some c → c = origConstrs[idx]'h
-
-/-- Combined checker invariant for execStepsFuel soundness. -/
-def CheckerInv (state : BoolCheckState) : Prop :=
-  DBSat state.db ∧
-  state.nextId > state.origConstrs.size ∧
-  OrigAgreement state.origConstrs state.db
-
 -- HashMap helper lemmas
 
 theorem HashMap_get?_empty (k : Nat) :
@@ -1099,42 +1065,6 @@ theorem HashMap_get?_insert (m : Std.HashMap Nat Constr) (k k' : Nat)
     (c : Constr) :
     (m.insert k c).get? k' = if k == k' then some c else m.get? k' := by
   simp only [Std.HashMap.get?_eq_getElem?, Std.HashMap.getElem?_insert]
-
-theorem OrigAgreement_insert (origConstrs : Array Constr)
-    (db : Std.HashMap Nat Constr) (id : Nat) (c : Constr)
-    (horig : OrigAgreement origConstrs db)
-    (hid : id > origConstrs.size) :
-    OrigAgreement origConstrs (db.insert id c) := by
-  intro idx hidx c' hget
-  rw [HashMap_get?_insert] at hget
-  by_cases heq : id == (idx + 1)
-  · simp [heq] at hget
-    have : id = idx + 1 := by simp [BEq.beq] at heq; exact heq
-    omega
-  · simp [heq] at hget
-    exact horig idx hidx c' hget
-
-theorem OrigAgreement_erase (origConstrs : Array Constr)
-    (db : Std.HashMap Nat Constr) (id : Nat)
-    (horig : OrigAgreement origConstrs db) :
-    OrigAgreement origConstrs (db.erase id) := by
-  intro idx hidx c' hget
-  have hget' : db.get? (idx + 1) = some c' := by
-    simp only [Std.HashMap.get?_eq_getElem?,
-      Std.HashMap.getElem?_erase] at hget ⊢
-    by_cases heq : id == (idx + 1)
-    · simp [heq] at hget
-    · simp [heq] at hget; exact hget
-  exact horig idx hidx c' hget'
-
-theorem OrigAgreement_erase_fold (origConstrs : Array Constr)
-    (db : Std.HashMap Nat Constr) (ids : List Nat)
-    (horig : OrigAgreement origConstrs db) :
-    OrigAgreement origConstrs (ids.foldl (fun db id => db.erase id) db) := by
-  induction ids generalizing db with
-  | nil => exact horig
-  | cons id rest ih =>
-    exact ih (db.erase id) (OrigAgreement_erase origConstrs db id horig)
 
 theorem DBSat_insert_dbImplied (db : Std.HashMap Nat Constr)
     (id : Nat) (c : Constr) (hsat : DBSat db)
@@ -1172,58 +1102,6 @@ theorem init_sound (constrs : Array Constr) (numVars : Nat) :
   fun id c hc v hsat => by
     simp only [BoolCheckState.fromConstrs] at hc
     exact hsat c (mkDBRec_mem constrs.toList 1 id c hc)
-
--- DB manipulation lemmas
-
-theorem unsat_of_contra_implied (original : Array Constr) (c : Constr)
-    (hcontra : c.isContra = true)
-    (himplied : ∀ v : Valuation,
-      (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v) :
-    formulaUnsat original := by
-  intro v
-  have hdec : Constr.coeffSum c < c.degree := by
-    simp only [Constr.isContra] at hcontra
-    exact of_decide_eq_true hcontra
-  exact Classical.byContradiction fun hne =>
-    let hsat := himplied v fun c' hc' =>
-      Classical.byContradiction fun hnsat => hne ⟨c', hc', hnsat⟩
-    contra_unsat c v hdec hsat
-
-theorem DBSound_erase (original : Array Constr) (db : Std.HashMap Nat Constr)
-    (id : Nat) (hsound : DBSound original db) :
-    DBSound original (db.erase id) := by
-  intro id' c hget v hsat
-  have hget' : db.get? id' = some c := by
-    simp only [Std.HashMap.get?_eq_getElem?,
-      Std.HashMap.getElem?_erase] at hget ⊢
-    by_cases heq : id == id'
-    · simp [heq] at hget
-    · simp [heq] at hget; exact hget
-  exact hsound id' c hget' v hsat
-
-theorem DBSound_erase_fold (original : Array Constr)
-    (db : Std.HashMap Nat Constr) (ids : List Nat)
-    (hsound : DBSound original db) :
-    DBSound original (ids.foldl (fun db id => db.erase id) db) := by
-  induction ids generalizing db with
-  | nil => exact hsound
-  | cons id rest ih =>
-    exact ih (db.erase id) (DBSound_erase original db id hsound)
-
-theorem DBSound_insert (original : Array Constr)
-    (db : Std.HashMap Nat Constr) (id : Nat) (c : Constr)
-    (hsound : DBSound original db)
-    (himplied : ∀ v : Valuation,
-      (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v) :
-    DBSound original (db.insert id c) := by
-  intro id' c' hget v hsat
-  rw [HashMap_get?_insert] at hget
-  by_cases heq : id == id'
-  · simp only [heq, ↓reduceIte] at hget
-    injection hget with hc; subst hc
-    exact himplied v hsat
-  · simp only [heq, Bool.false_eq_true, ↓reduceIte] at hget
-    exact hsound id' c' hget v hsat
 
 /-! ## Soundness proofs -/
 
@@ -2021,25 +1899,12 @@ theorem verifyRupBool_implied (negConstr : Constr)
 -- Main soundness chain
 
 -- Monotonicity: weakening the original formula preserves DBSound
-private theorem DBSound_weaken (original ext : Array Constr)
-    (db : Std.HashMap Nat Constr)
-    (hsound : DBSound original db)
-    (hsub : ∀ c, c ∈ original.toList → c ∈ ext.toList) :
-    DBSound ext db := fun id c hget v hsat =>
-  hsound id c hget v (fun c' hc' => hsat c' (hsub c' hc'))
 
 -- execStepsFuel_sound removed: checkProof_sound now uses execStepsFuel_sat_preserve
 /-- If ¬(c.negate.sat v) and c.degree ≤ c.coeffSum, then c.sat v. -/
 private theorem sat_of_not_negate_sat (c : Constr) (v : Valuation)
     (hd : c.degree ≤ c.coeffSum) (h : ¬ c.negate.sat v) : c.sat v :=
   Classical.byContradiction fun hn => h (negate_sat_of_not_sat c v hd hn)
-
-/-- A satisfiable constraint has degree ≤ coeffSum. -/
-private theorem degree_le_coeffSum_of_sat (c : Constr) (v : Valuation)
-    (h : c.sat v) : c.degree ≤ c.coeffSum := by
-  have hle := Sat.PB.evalSum_le_coeffSumR v c.terms
-  simp [Constr.sat] at h
-  simp [Constr.coeffSum]; omega
 
 /-- Resolve a goal ID to its constraint, mirroring processRedGoalsBool. -/
 -- checkRedCoverage soundness: if coverage passes, every affected DB entry
