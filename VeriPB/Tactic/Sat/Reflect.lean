@@ -307,7 +307,7 @@ private def constrInDB (c : Constr) (db : Std.HashMap Nat Constr) : Bool :=
        affected original constraint was deleted from savedDb.
     3. Every derived constraint in savedDb with affected variables must
        have a goal or be auto-satisfied. -/
-def checkRedCoverage (origConstrs : Array Constr)
+def checkRedCoverage (_origConstrs : Array Constr)
     (subst : List (Nat × Sat.PB.SubstVal))
     (savedDb : Std.HashMap Nat Constr)
     (goals : List (String × Array VeriPB.ProofStep × Nat)) : Bool :=
