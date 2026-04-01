@@ -413,9 +413,11 @@ elab "binpack_reflect " nm:ident ppSpace instTerm:term:max ppSpace proofFile:str
 
 -- Concrete instance
 
-/-- 21 items of sizes 21..41, 20 bins, capacity 40. -/
+/-- 21 items (sizes 21..40 plus one extra of size 21), 20 bins, capacity 40.
+    Every item fits individually (max size 40 = capacity), but no two
+    items share a bin (min pair 21+21 = 42 > 40). -/
 def inst21_20 : Instance :=
-  { sizes := List.range 21 |>.map (· + 21)
+  { sizes := (List.range 20 |>.map (· + 21)) ++ [21]
     numBins := 20
     capacity := 40 }
 
