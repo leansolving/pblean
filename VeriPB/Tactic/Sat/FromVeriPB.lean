@@ -281,18 +281,38 @@ def varNameToIdx (varName : String) : Except String Nat :=
 /-- Convert raw substitution string pairs to kernel-level (Nat x SubstVal). -/
 def parseSubstPairs (pairs : List (String × String)) (numVars : Nat) :
     Except String (List (Nat × Sat.PB.SubstVal)) :=
-  pairs.mapM fun (varStr, valStr) => do
-    let varIdx ← varNameToIdx varStr
-    let sv : Sat.PB.SubstVal ←
-      if valStr == "0" then .ok .zero
-      else if valStr == "1" then .ok .one
-      else match parseOPBLit valStr with
-      | .ok (.pos vn) => do
-        let j ← varNameToIdx vn; .ok (.posLit j)
-      | .ok (.neg vn) => do
-        let j ← varNameToIdx vn; .ok (.negLit j)
-      | .error e => .error s!"invalid substitution value '{valStr}': {e}"
-    .ok (varIdx, sv)
+  let rec go (remaining : List (String × String))
+      (seen : Std.HashSet Nat) (acc : List (Nat × Sat.PB.SubstVal)) :
+      Except String (List (Nat × Sat.PB.SubstVal)) :=
+    match remaining with
+    | [] => .ok acc
+    | (varStr, valStr) :: rest => do
+      let varIdx ← varNameToIdx varStr
+      if varIdx >= numVars then
+        .error s!"substitution variable {varStr} (index {varIdx}) out of range \
+          (numVars={numVars})"
+      else if seen.contains varIdx then
+        .error s!"duplicate substitution for variable {varStr} (index {varIdx})"
+      else
+        let sv : Sat.PB.SubstVal ←
+          if valStr == "0" then .ok .zero
+          else if valStr == "1" then .ok .one
+          else match parseOPBLit valStr with
+          | .ok (.pos vn) => do
+            let j ← varNameToIdx vn
+            if j >= numVars then
+              .error s!"substitution target {vn} (index {j}) out of range \
+                (numVars={numVars})"
+            else .ok (.posLit j)
+          | .ok (.neg vn) => do
+            let j ← varNameToIdx vn
+            if j >= numVars then
+              .error s!"substitution target ~{vn} (index {j}) out of range \
+                (numVars={numVars})"
+            else .ok (.negLit j)
+          | .error e => .error s!"invalid substitution value '{valStr}': {e}"
+        go rest (seen.insert varIdx) (acc ++ [(varIdx, sv)])
+  go pairs ∅ []
 
 /-- Check if a token looks like a variable name (starts with letter or ~). -/
 def isVarToken (tok : String) : Bool :=
@@ -702,13 +722,15 @@ private def normalizeConstrFast (c : Sat.PB.Constr) : Sat.PB.Constr :=
       else match m[lit]? with
         | some old => m.insert lit (old + coeff)
         | none     => m.insert lit coeff) ∅
-  -- Phase 2: collect unique variable indices
-  let vars : Std.HashSet Nat :=
-    merged.fold (fun s lit _ => s.insert lit.var) ∅
+  -- Phase 2: collect unique variable indices, sorted for deterministic order
+  let vars : Array Nat :=
+    (merged.fold (fun (s : Std.HashSet Nat) lit _ => s.insert lit.var) ∅).fold
+      (fun (a : Array Nat) v => a.push v) #[]
+  let vars := vars.qsort (· < ·)
   -- Phase 3: cancel complementary pairs, build result
   let initAcc : List Sat.PB.Term × Nat := ([], c.degree)
   let (resultTerms, resultDeg) :=
-    vars.fold (fun (acc : List Sat.PB.Term × Nat) v =>
+    vars.foldl (fun (acc : List Sat.PB.Term × Nat) v =>
       let posLit := Sat.PB.Literal.pos v
       let negLit := Sat.PB.Literal.neg v
       let posCoeff := merged[posLit]?.getD 0
@@ -1071,6 +1093,18 @@ def execPolRPN (ops : List PolOp) (db : Std.HashMap Nat Sat.PB.Constr) :
 
 -- Proof step executor (data-level checking)
 
+/-- Compare two normalized constraints by sorting terms. -/
+private def constrMatchNorm (c1 c2 : Sat.PB.Constr) : Bool :=
+  c1.degree == c2.degree && c1.terms.length == c2.terms.length &&
+  let sort := fun (ts : List Sat.PB.Term) =>
+    ts.mergeSort fun a b =>
+      Sat.PB.Literal.var a.2 < Sat.PB.Literal.var b.2 ||
+      (Sat.PB.Literal.var a.2 == Sat.PB.Literal.var b.2 &&
+       match a.2, b.2 with
+       | .pos _, .neg _ => true
+       | _, _ => false)
+  sort c1.terms == sort c2.terms
+
 mutual
 /-- Execute a single proof step, updating the check state. -/
 partial def execStep (state : CheckState) (step : ProofStep) : Except String CheckState :=
@@ -1129,6 +1163,20 @@ partial def execStep (state : CheckState) (step : ProofStep) : Except String Che
     let subst ← parseSubstPairs substPairs state.numVars
     -- Save DB snapshot, add negated constraint
     let savedDb := state.db
+    -- Coverage check: must have '#' goal and all affected constraints covered
+    let hasHashGoal := goals.any fun (gid, _, _) => gid.startsWith "#"
+    if !hasHashGoal then
+      throw "red: missing '#' goal for the new constraint"
+    let goalIds := goals.toList.filterMap fun (gid, _, _) =>
+      if gid.startsWith "#" then none else gid.toNat?
+    for (id, c) in savedDb.toList do
+      if Sat.PB.termsAffected subst c.terms then
+        let nc := normalizeConstr (Sat.PB.applySubstConstr subst c)
+        let autoSat := savedDb.toList.any fun (_, dbC) =>
+          constrMatchNorm nc (normalizeConstr dbC)
+        let covered := goalIds.contains id || autoSat
+        if !covered then
+          throw s!"red: affected constraint {id} not covered by goals or auto-satisfied"
     let negConstr := pbConstr.negate
     let negId := state.nextId
     let redDb := state.db.insert negId negConstr
@@ -1145,6 +1193,10 @@ partial def execStep (state : CheckState) (step : ProofStep) : Except String Che
         | some c => pure (Sat.PB.applySubstConstr subst c)
         | none => throw s!"red proofgoal {goalId}: constraint not in database"
       | none => throw s!"red proofgoal: invalid goal ID '{goalId}'"
+      -- Reject unsatisfiable goal constraints (negate requires degree ≤ coeffSum)
+      if goalConstr.degree > goalConstr.coeffSum then
+        throw s!"red proofgoal {goalId}: goal degree {goalConstr.degree} > \
+          coeffSum {goalConstr.coeffSum}"
       -- Add negated goal constraint to the red context DB
       let goalNeg := Sat.PB.Constr.negate goalConstr
       let goalDb := redDb.insert nextId goalNeg

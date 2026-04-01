@@ -572,13 +572,15 @@ private def normalizeFConstr (c : FConstr) : FConstr :=
       else match m[lit]? with
         | some old => m.insert lit (old + coeff)
         | none     => m.insert lit coeff) ∅
-  -- Phase 2: collect unique variable indices
-  let vars : Std.HashSet Nat :=
-    merged.fold (fun s lit _ => s.insert lit.var) ∅
+  -- Phase 2: collect unique variable indices, sorted for deterministic order
+  let vars : Array Nat :=
+    (merged.fold (fun (s : Std.HashSet Nat) lit _ => s.insert lit.var) ∅).fold
+      (fun (a : Array Nat) v => a.push v) #[]
+  let vars := vars.qsort (· < ·)
   -- Phase 3: cancel complementary pairs, build result
   let initAcc : Array (Nat × Sat.PB.Literal) × Nat := (#[], c.degree)
   let (resultTerms, resultDeg) :=
-    vars.fold (fun (acc : Array (Nat × Sat.PB.Literal) × Nat) v =>
+    vars.foldl (fun (acc : Array (Nat × Sat.PB.Literal) × Nat) v =>
       let posLit := Sat.PB.Literal.pos v
       let negLit := Sat.PB.Literal.neg v
       let posCoeff := merged[posLit]?.getD 0
