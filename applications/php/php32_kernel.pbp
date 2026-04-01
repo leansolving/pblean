@@ -1,0 +1,22 @@
+pseudo-Boolean proof version 3.0
+f 7;
+pol 1 s;
+pol 8 2 + 3 +;
+pol 9 2 d;
+red 1 x1 >= 1 : x1 -> x3 x3 -> x5 x5 -> x1 x2 -> x4 x4 -> x6 x6 -> x2 : subproof
+	proofgoal #1
+pol 12 11 + 5 + 6 +;
+pol 13 4 +;
+pol 14 x6 +;
+	qed : 15;
+	proofgoal 1
+pol 16 2 +;
+	qed : 17;
+qed;
+pol 18 10 +;
+pol 19 6 +;
+pol 20 7 +;
+pol 21 4 +;
+output NONE ;
+conclusion UNSAT : 22;
+end pseudo-Boolean proof;

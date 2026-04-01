@@ -50,4 +50,12 @@ veripb_reflect dom_basic_reflect
   "VeriPB/Tactic/Sat/Tests/data/dom_basic.opb"
   "VeriPB/Tactic/Sat/Tests/data/dom_basic_kernel.pbp"
 
+-- PHP(3,2): pigeonhole principle with symmetry-breaking via red rule.
+-- Proof uses red to add x1≥1 (WLOG pigeon 1 goes to hole 1) with a cyclic
+-- substitution (x1↔x3↔x5, x2↔x4↔x6), then derives contradiction via pol.
+-- Elaborated from VeriPB test suite: redundance_explicit_subproof.
+veripb_reflect php32_red_reflect
+  "applications/php/php32.opb"
+  "applications/php/php32_kernel.pbp"
+
 end VeriPB.Tests.Reflect
