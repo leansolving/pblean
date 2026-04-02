@@ -348,4 +348,211 @@ schur_reflect schur5_impossible 5
 theorem schur_number_2 : schurNumber 4 :=
   ⟨schur4_exists, schur5_impossible⟩
 
+-- ============================================================
+-- Generalized S(k): k-coloring Schur-freeness
+-- ============================================================
+
+/-- Variable index for "element i has color c" with k colors.
+    Elements are 1-based, colors are 0-based. -/
+def kVar (k : Nat) (i c : Nat) : Nat := (i - 1) * k + c
+
+/-- At-least-one constraint: element i gets at least one color. -/
+def mkAtLeastOne (k i : Nat) : Constr :=
+  ⟨(List.range k).map fun c => (1, Literal.pos (kVar k i c)), 1⟩
+
+/-- No-monochromatic-triple constraint for color c and triple (a,b,a+b). -/
+def mkNoMonoTriple (k a b c col : Nat) : Constr :=
+  ⟨[(1, Literal.neg (kVar k a col)),
+    (1, Literal.neg (kVar k b col)),
+    (1, Literal.neg (kVar k c col))], 1⟩
+
+/-- Encode k-coloring Schur-freeness of {1,...,n}. -/
+def encodeK (k n : Nat) : Array Constr :=
+  let alo := (List.range n).map fun i0 => mkAtLeastOne k (i0 + 1)
+  let triples := schurTriples n
+  let mono := triples.flatMap fun (a, b, c) =>
+    (List.range k).map fun col => mkNoMonoTriple k a b c col
+  (alo ++ mono).toArray
+
+-- Mathematical predicate for k-coloring Schur-freeness
+
+/-- A k-coloring of {1,...,n} assigns each element a color in {0,...,k-1}. -/
+def isKSchurFree (k n : Nat) (f : Nat → Nat) : Prop :=
+  (∀ i, 1 ≤ i → i ≤ n → f i < k) ∧
+  (∀ a b : Nat, 1 ≤ a → a ≤ b → a + b ≤ n →
+    ¬(f a = f b ∧ f b = f (a + b)))
+
+def hasKSchurFreeColoring (k n : Nat) : Prop :=
+  ∃ f : Nat → Nat, isKSchurFree k n f
+
+-- Soundness of k-coloring encoding
+
+/-- Convert a Nat→Nat coloring to a valuation on encoding variables. -/
+def kColoringVal (k : Nat) (f : Nat → Nat) (v : Nat) : Bool :=
+  f (v / k + 1) == (v % k)
+
+private theorem kColoringVal_eq (k : Nat) (f : Nat → Nat) (i c : Nat)
+    (hk : 0 < k) (hi : 1 ≤ i) (hc : c < k) :
+    kColoringVal k f (kVar k i c) = (f i == c) := by
+  simp only [kColoringVal, kVar]
+  have hmod : ((i - 1) * k + c) % k = c := by
+    rw [show (i - 1) * k + c = c + (i - 1) * k by omega]
+    rw [Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt hc]
+  have hdiv : ((i - 1) * k + c) / k = i - 1 := by
+    rw [show (i - 1) * k + c = c + (i - 1) * k by omega]
+    rw [Nat.add_mul_div_right _ _ hk, Nat.div_eq_of_lt hc, Nat.zero_add]
+  simp [hmod, hdiv, show i - 1 + 1 = i by omega]
+
+private theorem kColoringVal_pos (k : Nat) (f : Nat → Nat) (i c : Nat)
+    (hk : 0 < k) (hi : 1 ≤ i) (hc : c < k) :
+    evalLit (kColoringVal k f) (Literal.pos (kVar k i c)) =
+      if f i = c then 1 else 0 := by
+  simp only [evalLit, kColoringVal_eq k f i c hk hi hc]
+  cases h : (f i == c) <;> simp_all [beq_iff_eq, beq_eq_false_iff_ne]
+
+private theorem kColoringVal_neg (k : Nat) (f : Nat → Nat) (i c : Nat)
+    (hk : 0 < k) (hi : 1 ≤ i) (hc : c < k) :
+    evalLit (kColoringVal k f) (Literal.neg (kVar k i c)) =
+      if f i = c then 0 else 1 := by
+  simp only [evalLit, kColoringVal_eq k f i c hk hi hc]
+  cases h : (f i == c) <;> simp_all [beq_iff_eq, beq_eq_false_iff_ne]
+
+private theorem evalSum_ge_mem' (f : Valuation) (ts : List (Nat × Sat.PB.Literal))
+    (t : Nat × Sat.PB.Literal) (ht : t ∈ ts) :
+    t.1 * evalLit f t.2 ≤ evalSum f ts := by
+  induction ts with
+  | nil => exact absurd ht (List.not_mem_nil)
+  | cons hd tl ih =>
+    simp only [evalSum]
+    rcases List.mem_cons.mp ht with rfl | htl
+    · omega
+    · have := ih htl; omega
+
+private theorem alo_sat (k : Nat) (f : Nat → Nat) (i : Nat)
+    (hk : 0 < k) (hi : 1 ≤ i) (hfi : f i < k) :
+    (mkAtLeastOne k i).sat (kColoringVal k f) := by
+  simp only [Constr.sat, mkAtLeastOne]
+  have hmem : (1, Literal.pos (kVar k i (f i))) ∈
+      (List.range k).map fun c => (1, Literal.pos (kVar k i c)) :=
+    List.mem_map.mpr ⟨f i, List.mem_range.mpr hfi, rfl⟩
+  have hge := evalSum_ge_mem' (kColoringVal k f) _ _ hmem
+  rw [kColoringVal_pos k f i (f i) hk hi hfi] at hge
+  simp at hge; omega
+
+private theorem mono_sat (k : Nat) (f : Nat → Nat) (a b c col n : Nat)
+    (hk : 0 < k) (ha : 1 ≤ a) (hab : a ≤ b) (hle : a + b ≤ n)
+    (hcol : col < k)
+    (hfree : ∀ a' b' : Nat, 1 ≤ a' → a' ≤ b' → a' + b' ≤ n →
+      ¬(f a' = f b' ∧ f b' = f (a' + b')))
+    (hc : c = a + b) :
+    (mkNoMonoTriple k a b c col).sat (kColoringVal k f) := by
+  simp only [Constr.sat, mkNoMonoTriple, evalSum,
+    kColoringVal_neg k f a col hk ha hcol,
+    kColoringVal_neg k f b col hk (by omega) hcol,
+    kColoringVal_neg k f c col hk (by omega) hcol]
+  -- If not all three equal col, at least one if-branch produces 1
+  split
+  · next ha' =>
+    split
+    · next hb' =>
+      split
+      · next hc' =>
+        exact absurd ⟨ha'.trans hb'.symm, hb'.trans (hc ▸ hc').symm⟩
+          (hfree a b ha hab (hc ▸ hle))
+      · omega
+    · omega
+  · omega
+
+theorem no_k_schur_free_of_unsat (k n : Nat) (hk : 0 < k)
+    (hunsat : ∀ v : Valuation,
+      ∃ c ∈ (encodeK k n).toList, ¬c.sat v) :
+    ¬hasKSchurFreeColoring k n := by
+  intro ⟨f, ⟨hcol, hfree⟩⟩
+  obtain ⟨constr, hconstr, hnsat⟩ := hunsat (kColoringVal k f)
+  apply hnsat
+  have henc : (encodeK k n).toList =
+      (List.range n).map (fun i0 => mkAtLeastOne k (i0 + 1)) ++
+      (schurTriples n).flatMap (fun (a, b, c) =>
+        (List.range k).map fun col => mkNoMonoTriple k a b c col) := by
+    simp [encodeK]
+  rw [henc] at hconstr
+  simp only [List.mem_append] at hconstr
+  rcases hconstr with hconstr | hconstr
+  · -- At-least-one constraint
+    simp only [List.mem_map, List.mem_range] at hconstr
+    obtain ⟨i0, hi0, rfl⟩ := hconstr
+    exact alo_sat k f (i0 + 1) hk (by omega) (hcol (i0 + 1) (by omega) (by omega))
+  · -- Monochromatic-triple constraint
+    simp only [List.mem_flatMap, List.mem_map, List.mem_range] at hconstr
+    obtain ⟨⟨a, b, c⟩, htri, col, hcol_lt, rfl⟩ := hconstr
+    have ⟨ha, hab, hle, hc⟩ : 1 ≤ a ∧ a ≤ b ∧ a + b ≤ n ∧ c = a + b := by
+      simp only [schurTriples, List.mem_flatMap, List.mem_range,
+        List.mem_filterMap] at htri
+      obtain ⟨a0, ha0, b0, hb0, hcond⟩ := htri
+      split at hcond
+      · next hle =>
+        simp only [Option.some.injEq, Prod.mk.injEq] at hcond
+        obtain ⟨rfl, rfl, rfl⟩ := hcond
+        simp only [Bool.and_eq_true, decide_eq_true_eq] at hle
+        exact ⟨by omega, hle.1, hle.2, rfl⟩
+      · simp at hcond
+    exact mono_sat k f a b c col n hk ha hab hle hcol_lt hfree hc
+
+-- Reflection command for k-coloring Schur
+elab "schurk_reflect " nm:ident ppSpace kTerm:num ppSpace nTerm:num
+    ppSpace proofFile:str : command => do
+  let name := (← getCurrNamespace) ++ nm.getId
+  let k := kTerm.getNat
+  let n := nTerm.getNat
+  let proofPath := proofFile.getString
+  liftTermElabM do
+    let kExpr := mkRawNatLit k
+    let nExpr := mkRawNatLit n
+    let numVarsExpr := mkRawNatLit (n * k)
+    let proofStr ← IO.FS.readFile (System.FilePath.mk proofPath)
+    let constrsExpr := mkApp2 (mkConst ``encodeK) kExpr nExpr
+    let proofStrExpr := mkStrLit proofStr
+    let checkExpr := mkApp3
+      (mkConst ``VeriPB.Reflect.checkProofBool)
+      constrsExpr numVarsExpr proofStrExpr
+    let auxName := name ++ `_check
+    addAndCompile <| .defnDecl {
+      name := auxName
+      levelParams := []
+      type := mkConst ``Bool
+      value := checkExpr
+      hints := .abbrev
+      safety := .safe
+    }
+    let auxConst := mkConst auxName
+    let reduceBoolApp := mkApp (mkConst ``Lean.reduceBool) auxConst
+    let rflPrf := mkApp2 (mkConst ``Eq.refl [.succ .zero])
+      (mkConst ``Bool) reduceBoolApp
+    let hEqTrue := mkApp3 (mkConst ``Lean.ofReduceBool)
+      auxConst (mkConst ``Bool.true) rflPrf
+    let unsatProof := mkApp4
+      (mkConst ``VeriPB.Reflect.checkProof_sound)
+      constrsExpr numVarsExpr proofStrExpr hEqTrue
+    if k == 0 then throwError "k must be positive"
+    let hkType := mkApp4 (mkConst ``LT.lt [.zero])
+      (mkConst ``Nat) (mkConst ``instLTNat) (mkRawNatLit 0) kExpr
+    let hkProof ← mkDecideProof hkType
+    let finalProof := mkApp4
+      (mkConst ``no_k_schur_free_of_unsat)
+      kExpr nExpr hkProof unsatProof
+    let finalType := mkApp (mkConst ``Not)
+      (mkApp2 (mkConst ``hasKSchurFreeColoring) kExpr nExpr)
+    addDecl <| Declaration.thmDecl {
+      name
+      levelParams := []
+      type := finalType
+      value := finalProof
+    }
+    Lean.logInfo m!"Registered {name} : ¬ hasKSchurFreeColoring {k} {n}"
+
+-- S(3) upper bound: {1,...,14} has no Schur-free 3-coloring
+-- 42 variables, 161 constraints
+schurk_reflect schur14_impossible 3 14
+  "applications/schur/schur14_3_kernel.pbp"
+
 end Schur

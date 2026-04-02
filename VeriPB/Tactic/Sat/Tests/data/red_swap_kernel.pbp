@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+f 4;
+red 1 x1 >= 1 : x1 -> x2 x2 -> x1 : subproof
+	proofgoal #1
+pol 5 1 + 6 +;
+	qed : 7;
+qed;
+pol 8 2 + 4 + 8 +;
+output NONE ;
+conclusion UNSAT : 9;
+end pseudo-Boolean proof;

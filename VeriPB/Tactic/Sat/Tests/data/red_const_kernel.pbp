@@ -1,0 +1,25 @@
+pseudo-Boolean proof version 3.0
+f 4;
+red 1 ~x1 >= 1 : x1 -> 0 : subproof
+	proofgoal #1
+	qed : 6;
+	proofgoal 1
+	qed : 7;
+	proofgoal 2
+	qed : 8;
+	proofgoal 3
+pol 5 1 +;
+pol 10 9 +;
+	qed : 11;
+	proofgoal 4
+pol 12 2 +;
+pol 13 5 +;
+	qed : 14;
+qed;
+pol 15 3 +;
+pol 16 4 +;
+pol 17 2 +;
+pol 16 18 +;
+output NONE ;
+conclusion UNSAT : 19;
+end pseudo-Boolean proof;

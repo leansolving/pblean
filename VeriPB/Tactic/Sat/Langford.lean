@@ -561,4 +561,9 @@ elab "langford_reflect " nm:ident ppSpace nTerm:num
 langford_reflect langford6_impossible 6
   "applications/langford/langford6_kernel.pbp"
 
+-- L(2,9) impossibility verified via VeriPB reflection checker
+-- 152 variables, 1867 constraints
+langford_reflect langford9_impossible 9
+  "applications/langford/langford9_kernel.pbp"
+
 end Langford

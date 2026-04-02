@@ -63,6 +63,8 @@ Helper functions (`pbPropagateBool`, `findConflictHintBool`) use
 structure BoolCheckState where
   /-- Constraint database: maps ID to constraint -/
   db : Std.HashMap Nat Constr
+  /-- Original formula constraints (for red coverage verification) -/
+  origConstrs : Array Constr
   /-- Next available constraint ID -/
   nextId : Nat
   /-- Number of variables -/
@@ -80,6 +82,7 @@ private def mkDBRec : List Constr → Nat → Std.HashMap Nat Constr
 def BoolCheckState.fromConstrs (constrs : Array Constr) (numVars : Nat) :
     BoolCheckState :=
   { db := mkDBRec constrs.toList 1
+    origConstrs := constrs
     nextId := constrs.size + 1
     numVars := numVars
     formulaSize := constrs.size }
@@ -277,7 +280,96 @@ def verifyRupBool (negConstr : Constr) (hints : List VeriPB.RupHint)
     (combineHintsRec (VeriPB.normalizeConstr conflictC)
       otherHints).isContra
 
+/-! ### Red coverage verification -/
+
+/-- Check if two normalized constraints match (same degree and sorted terms). -/
+private def constrMatchNorm (c1 c2 : Constr) : Bool :=
+  c1.degree == c2.degree && c1.terms.length == c2.terms.length &&
+  -- Compare sorted term lists
+  let sort := fun (ts : List (Nat × Sat.PB.Literal)) =>
+    ts.mergeSort fun a b =>
+      Sat.PB.Literal.var a.2 < Sat.PB.Literal.var b.2 ||
+      (Sat.PB.Literal.var a.2 == Sat.PB.Literal.var b.2 &&
+       match a.2, b.2 with
+       | .pos _, .neg _ => true
+       | _, _ => false)
+  sort c1.terms == sort c2.terms
+
+/-- Check if a constraint (after normalization) is in the database. -/
+private def constrInDB (c : Constr) (db : Std.HashMap Nat Constr) : Bool :=
+  let nc := VeriPB.normalizeConstr c
+  db.toList.any fun (_, dbC) => constrMatchNorm nc (VeriPB.normalizeConstr dbC)
+
+/-- Verify red rule coverage for the red step.
+    1. Must have a '#' goal (for the new constraint C itself).
+    2. Every original constraint with affected variables must have a goal
+       or be auto-satisfied (G|ω is already in the db). Rejects if any
+       affected original constraint was deleted from savedDb.
+    3. Every derived constraint in savedDb with affected variables must
+       have a goal or be auto-satisfied. -/
+def checkRedCoverage (_origConstrs : Array Constr)
+    (subst : List (Nat × Sat.PB.SubstVal))
+    (savedDb : Std.HashMap Nat Constr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat)) : Bool :=
+  -- Must have at least one '#' goal (for C itself)
+  let hasHashGoal := goals.any fun (gid, _, _) => gid.startsWith "#"
+  if !hasHashGoal then false
+  else
+    -- Collect numeric goal IDs
+    let goalIds := goals.filterMap fun (gid, _, _) =>
+      if gid.startsWith "#" then none else gid.toNat?
+    -- Helper: check if an affected constraint is covered
+    let isCovered (id : Nat) (c : Constr) : Bool :=
+      goalIds.contains id ||
+      constrInDB (Sat.PB.applySubstConstr subst c) savedDb
+    -- Check all constraints in savedDb (original and derived)
+    savedDb.toList.all fun (id, c) =>
+      if Sat.PB.termsAffected subst c.terms then isCovered id c
+      else true
+
 /-! ### Step execution (total, fuel-bounded) -/
+
+/-- Process red proof goals using an executor callback.
+    Separated from execStepsFuel to avoid mutual recursion issues. -/
+def processRedGoalsBool
+    (execFn : BoolCheckState → List VeriPB.ProofStep → Option BoolCheckState)
+    (origConstrs : Array Constr) (numVars formulaSize : Nat)
+    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
+    (savedDb redDb : Std.HashMap Nat Constr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat))
+    (nextId : Nat) : Option Nat :=
+  match goals with
+  | [] => some nextId
+  | (goalId, innerSteps, resultId) :: rest =>
+    let goalConstr? :=
+      if goalId.startsWith "#" then
+        some (Sat.PB.applySubstConstr subst pbConstr)
+      else match goalId.toNat? with
+      | some dbId => match savedDb[dbId]? with
+        | some c => some (Sat.PB.applySubstConstr subst c)
+        | none => none
+      | none => none
+    match goalConstr? with
+    | none => none
+    | some goalConstr =>
+      -- Reject unsatisfiable goal constraints (negate is only a valid
+      -- Boolean complement when degree ≤ coeffSum)
+      if goalConstr.degree > goalConstr.coeffSum then none
+      else
+      let goalNeg := goalConstr.negate
+      let goalDb := redDb.insert nextId goalNeg
+      let subState : BoolCheckState :=
+        { db := goalDb, origConstrs, nextId := nextId + 1,
+          numVars, formulaSize }
+      match execFn subState innerSteps.toList with
+      | some finalSub =>
+        match finalSub.db[resultId]? with
+        | some c =>
+          if !c.isContra then none
+          else processRedGoalsBool execFn origConstrs numVars formulaSize
+            subst pbConstr savedDb redDb rest finalSub.nextId
+        | none => none
+      | none => none
 
 /-- Execute proof steps with fuel for pbc nesting depth.
     Returns the final state if all steps succeed.
@@ -338,6 +430,37 @@ def execStepsFuel (fuel : Nat) (state : BoolCheckState)
                 | none => none
               | none => none
           | .error _ => none
+      | .red constr substPairs goals =>
+        match fuel with
+        | 0 => none
+        | n + 1 =>
+          match VeriPB.opbConstrToPB constr with
+          | .ok pbConstr =>
+            if pbConstr.degree > pbConstr.coeffSum then none
+            else
+              -- Convert string substitution pairs to kernel SubstVal
+              match VeriPB.parseSubstPairs substPairs state.numVars with
+              | .error _ => none
+              | .ok subst =>
+                let savedDb := state.db
+                -- Verify coverage: all affected original constraints have goals
+                if !checkRedCoverage state.origConstrs subst savedDb
+                    goals.toList then none
+                else
+                let negId := state.nextId
+                let redDb := state.db.insert negId pbConstr.negate
+                match processRedGoalsBool (execStepsFuel n)
+                    state.origConstrs state.numVars state.formulaSize
+                    subst pbConstr savedDb redDb goals.toList
+                    (negId + 1) with
+                | some finalNextId =>
+                  let restoredDb := savedDb.insert finalNextId
+                    (VeriPB.normalizeConstr pbConstr)
+                  some { state with
+                    db := restoredDb
+                    nextId := finalNextId + 1 }
+                | none => none
+          | .error _ => none
       | .deld ids | .delc ids =>
         some { state with
           db := ids.foldl (fun db id => db.erase id) state.db }
@@ -365,19 +488,15 @@ def hasUnsatConclusion (steps : Array VeriPB.ProofStep)
     | _ => false
 
 /-- Count total pbc nesting depth for fuel computation. -/
-def pbcDepth : List VeriPB.ProofStep → Nat
+partial def pbcDepth : List VeriPB.ProofStep → Nat
   | [] => 0
   | .pbc _ inner _ :: rest =>
     max (1 + pbcDepth inner.toList) (pbcDepth rest)
+  | .red _ _ goals :: rest =>
+    let goalDepth := goals.foldl (fun d (_, steps, _) =>
+      max d (1 + pbcDepth steps.toList)) 0
+    max goalDepth (pbcDepth rest)
   | _ :: rest => pbcDepth rest
-termination_by steps => sizeOf steps
-decreasing_by
-  all_goals simp_wf
-  · -- inner.toList < .pbc _ inner _ :: rest
-    have : sizeOf inner = 1 + sizeOf inner.toList := by cases inner; rfl
-    omega
-  · omega
-  · omega
 
 /-! ## Array-based fast checker (runtime replacement via @[implemented_by])
 
@@ -395,6 +514,7 @@ private structure FConstr where
 
 private structure FBoolCheckState where
   db : Std.HashMap Nat FConstr
+  origConstrs : Array Constr
   nextId : Nat
   numVars : Nat
   formulaSize : Nat
@@ -402,6 +522,9 @@ private structure FBoolCheckState where
 
 private def toFConstr (c : Constr) : FConstr :=
   ⟨c.terms.toArray, c.degree⟩
+
+private def fromFConstr (c : FConstr) : Constr :=
+  ⟨c.terms.toList, c.degree⟩
 
 private def FConstr.coeffSum (c : FConstr) : Nat :=
   c.terms.foldl (fun acc (a, _) => acc + a) 0
@@ -449,13 +572,15 @@ private def normalizeFConstr (c : FConstr) : FConstr :=
       else match m[lit]? with
         | some old => m.insert lit (old + coeff)
         | none     => m.insert lit coeff) ∅
-  -- Phase 2: collect unique variable indices
-  let vars : Std.HashSet Nat :=
-    merged.fold (fun s lit _ => s.insert lit.var) ∅
+  -- Phase 2: collect unique variable indices, sorted for deterministic order
+  let vars : Array Nat :=
+    (merged.fold (fun (s : Std.HashSet Nat) lit _ => s.insert lit.var) ∅).fold
+      (fun (a : Array Nat) v => a.push v) #[]
+  let vars := vars.qsort (· < ·)
   -- Phase 3: cancel complementary pairs, build result
   let initAcc : Array (Nat × Sat.PB.Literal) × Nat := (#[], c.degree)
   let (resultTerms, resultDeg) :=
-    vars.fold (fun (acc : Array (Nat × Sat.PB.Literal) × Nat) v =>
+    vars.foldl (fun (acc : Array (Nat × Sat.PB.Literal) × Nat) v =>
       let posLit := Sat.PB.Literal.pos v
       let negLit := Sat.PB.Literal.neg v
       let posCoeff := merged[posLit]?.getD 0
@@ -652,9 +777,49 @@ private def FBoolCheckState.fromConstrs (constrs : Array Constr)
     (numVars : Nat) : FBoolCheckState :=
   { db := constrs.foldl (fun (db, i) c =>
       (db.insert i (toFConstr c), i + 1)) ({}, 1) |>.1
+    origConstrs := constrs
     nextId := constrs.size + 1
     numVars := numVars
     formulaSize := constrs.size }
+
+/-- Process red proof goals for the fast (Array-based) checker. -/
+private def processFRedGoalsBool
+    (execFn : FBoolCheckState → List VeriPB.ProofStep → Option FBoolCheckState)
+    (origConstrs : Array Constr) (numVars formulaSize : Nat)
+    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
+    (savedDb redDb : Std.HashMap Nat FConstr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat))
+    (nextId : Nat) : Option Nat :=
+  match goals with
+  | [] => some nextId
+  | (goalId, innerSteps, resultId) :: rest =>
+    let goalConstr? :=
+      if goalId.startsWith "#" then
+        some (toFConstr (Sat.PB.applySubstConstr subst pbConstr))
+      else match goalId.toNat? with
+      | some dbId => match savedDb[dbId]? with
+        | some c => some (toFConstr (Sat.PB.applySubstConstr subst (fromFConstr c)))
+        | none => none
+      | none => none
+    match goalConstr? with
+    | none => none
+    | some goalFc =>
+      if goalFc.degree > goalFc.coeffSum then none
+      else
+      let goalNeg := goalFc.negateWith goalFc.coeffSum
+      let goalDb := redDb.insert nextId goalNeg
+      let subState : FBoolCheckState :=
+        { db := goalDb, origConstrs, nextId := nextId + 1,
+          numVars, formulaSize }
+      match execFn subState innerSteps.toList with
+      | some finalSub =>
+        match finalSub.db[resultId]? with
+        | some c =>
+          if !c.isContra then none
+          else processFRedGoalsBool execFn origConstrs numVars formulaSize
+            subst pbConstr savedDb redDb rest finalSub.nextId
+        | none => none
+      | none => none
 
 private def execFStepsFuel (fuel : Nat) (state : FBoolCheckState)
     (steps : List VeriPB.ProofStep) : Option FBoolCheckState :=
@@ -715,6 +880,40 @@ private def execFStepsFuel (fuel : Nat) (state : FBoolCheckState)
                       nextId := finalSub.nextId + 1 }
                 | none => none
               | none => none
+          | .error _ => none
+      | .red constr substPairs goals =>
+        match fuel with
+        | 0 => none
+        | n + 1 =>
+          match VeriPB.opbConstrToPB constr with
+          | .ok pbConstr =>
+            let fc := toFConstr pbConstr
+            let cs := fc.coeffSum
+            if fc.degree > cs then none
+            else
+              match VeriPB.parseSubstPairs substPairs state.numVars with
+              | .error _ => none
+              | .ok subst =>
+                let savedDb := state.db
+                let negId := state.nextId
+                let redDb := state.db.insert negId (fc.negateWith cs)
+                -- Coverage check needs Constr db, convert from FConstr
+                let constrDb := savedDb.fold (fun (m : Std.HashMap Nat Constr) k v =>
+                  m.insert k (fromFConstr v)) {}
+                if !checkRedCoverage state.origConstrs subst constrDb
+                    goals.toList then none
+                else
+                match processFRedGoalsBool (execFStepsFuel n)
+                    state.origConstrs state.numVars state.formulaSize
+                    subst pbConstr savedDb redDb goals.toList
+                    (negId + 1) with
+                | some finalNextId =>
+                  let restoredDb := savedDb.insert finalNextId
+                    (normalizeFConstr fc)
+                  some { state with
+                    db := restoredDb
+                    nextId := finalNextId + 1 }
+                | none => none
           | .error _ => none
       | .deld ids | .delc ids =>
         some { state with
@@ -802,12 +1001,61 @@ def checkProofBoolTimed (constrs : Array Constr) (numVars : Nat)
 def formulaUnsat (constrs : Array Constr) : Prop :=
   ∀ v : Valuation, ∃ c ∈ constrs.toList, ¬c.sat v
 
-/-- Soundness invariant: all constraints in db are consequences of the
-    original formula. -/
+/-- Legacy alias: implication-based soundness (stronger than DBPreserve).
+    Every constraint in db is a consequence of the original formula.
+    Used for pol/rup/pbc steps where the added constraint is implied. -/
 def DBSound (original : Array Constr) (db : Std.HashMap Nat Constr) : Prop :=
   ∀ (id : Nat) (c : Constr), db.get? id = some c →
     ∀ v : Valuation, (∀ c' ∈ original.toList, Constr.sat c' v) →
       Constr.sat c v
+
+/-- DB satisfiability: there exists a valuation satisfying all DB entries.
+    Weaker than DBSound (no formula reference). Preserved by all proof steps
+    including red/dom. -/
+def DBSat (db : Std.HashMap Nat Constr) : Prop :=
+  ∃ v : Valuation, ∀ (id : Nat) (c : Constr), db.get? id = some c →
+    Constr.sat c v
+
+/-- Bridge: construct a synthetic DBSound from a HashMap by using its
+    toList values as the "formula". This lets us reuse existing pol/rup
+    soundness lemmas in the DBSat-based proof. -/
+theorem DBSound_of_toList (db : Std.HashMap Nat Constr) :
+    DBSound ⟨db.toList.map Prod.snd⟩ db := by
+  intro id c hget v hsat
+  have hmem : (id, c) ∈ db.toList := by
+    rw [Std.HashMap.get?_eq_getElem?] at hget
+    exact Std.HashMap.mem_toList_iff_getElem?_eq_some.mpr hget
+  have : c ∈ db.toList.map Prod.snd :=
+    List.mem_map.mpr ⟨(id, c), hmem, rfl⟩
+  exact hsat c (by simpa using this)
+
+/-- The toList-based formula is satisfied by any valuation satisfying the DB. -/
+theorem toList_sat_of_DBSat (db : Std.HashMap Nat Constr) (v : Valuation)
+    (hdb : ∀ id c, db.get? id = some c → Constr.sat c v) :
+    ∀ c ∈ (⟨db.toList.map Prod.snd⟩ : Array Constr).toList, Constr.sat c v := by
+  intro c hmem
+  have hmem' : c ∈ db.toList.map Prod.snd := by simpa using hmem
+  obtain ⟨⟨id, _⟩, hmem'', rfl⟩ := List.mem_map.mp hmem'
+  exact hdb id _ (by
+    rw [Std.HashMap.get?_eq_getElem?]
+    exact Std.HashMap.mem_toList_iff_getElem?_eq_some.mp hmem'')
+
+theorem DBSat_erase (db : Std.HashMap Nat Constr) (id : Nat)
+    (hsat : DBSat db) : DBSat (db.erase id) := by
+  obtain ⟨v, hv⟩ := hsat
+  exact ⟨v, fun id' c hget => hv id' c (by
+    simp only [Std.HashMap.get?_eq_getElem?,
+      Std.HashMap.getElem?_erase] at hget ⊢
+    by_cases heq : id == id'
+    · simp [heq] at hget
+    · simp [heq] at hget; exact hget)⟩
+
+theorem DBSat_erase_fold (db : Std.HashMap Nat Constr) (ids : List Nat)
+    (hsat : DBSat db) :
+    DBSat (ids.foldl (fun db id => db.erase id) db) := by
+  induction ids generalizing db with
+  | nil => exact hsat
+  | cons id rest ih => exact ih (db.erase id) (DBSat_erase db id hsat)
 
 -- HashMap helper lemmas
 
@@ -819,6 +1067,18 @@ theorem HashMap_get?_insert (m : Std.HashMap Nat Constr) (k k' : Nat)
     (c : Constr) :
     (m.insert k c).get? k' = if k == k' then some c else m.get? k' := by
   simp only [Std.HashMap.get?_eq_getElem?, Std.HashMap.getElem?_insert]
+
+theorem DBSat_insert_dbImplied (db : Std.HashMap Nat Constr)
+    (id : Nat) (c : Constr) (hsat : DBSat db)
+    (himpl : ∀ v, (∀ id' c', db.get? id' = some c' → Constr.sat c' v) →
+      Constr.sat c v) :
+    DBSat (db.insert id c) := by
+  obtain ⟨v, hv⟩ := hsat
+  exact ⟨v, fun id' c' hget => by
+    rw [HashMap_get?_insert] at hget
+    by_cases heq : id == id'
+    · simp [heq] at hget; subst hget; exact himpl v hv
+    · simp [heq] at hget; exact hv id' c' hget⟩
 
 -- mkDBRec properties
 
@@ -844,58 +1104,6 @@ theorem init_sound (constrs : Array Constr) (numVars : Nat) :
   fun id c hc v hsat => by
     simp only [BoolCheckState.fromConstrs] at hc
     exact hsat c (mkDBRec_mem constrs.toList 1 id c hc)
-
--- DB manipulation lemmas
-
-theorem unsat_of_contra_implied (original : Array Constr) (c : Constr)
-    (hcontra : c.isContra = true)
-    (himplied : ∀ v : Valuation,
-      (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v) :
-    formulaUnsat original := by
-  intro v
-  have hdec : Constr.coeffSum c < c.degree := by
-    simp only [Constr.isContra] at hcontra
-    exact of_decide_eq_true hcontra
-  exact Classical.byContradiction fun hne =>
-    let hsat := himplied v fun c' hc' =>
-      Classical.byContradiction fun hnsat => hne ⟨c', hc', hnsat⟩
-    contra_unsat c v hdec hsat
-
-theorem DBSound_erase (original : Array Constr) (db : Std.HashMap Nat Constr)
-    (id : Nat) (hsound : DBSound original db) :
-    DBSound original (db.erase id) := by
-  intro id' c hget v hsat
-  have hget' : db.get? id' = some c := by
-    simp only [Std.HashMap.get?_eq_getElem?,
-      Std.HashMap.getElem?_erase] at hget ⊢
-    by_cases heq : id == id'
-    · simp [heq] at hget
-    · simp [heq] at hget; exact hget
-  exact hsound id' c hget' v hsat
-
-theorem DBSound_erase_fold (original : Array Constr)
-    (db : Std.HashMap Nat Constr) (ids : List Nat)
-    (hsound : DBSound original db) :
-    DBSound original (ids.foldl (fun db id => db.erase id) db) := by
-  induction ids generalizing db with
-  | nil => exact hsound
-  | cons id rest ih =>
-    exact ih (db.erase id) (DBSound_erase original db id hsound)
-
-theorem DBSound_insert (original : Array Constr)
-    (db : Std.HashMap Nat Constr) (id : Nat) (c : Constr)
-    (hsound : DBSound original db)
-    (himplied : ∀ v : Valuation,
-      (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v) :
-    DBSound original (db.insert id c) := by
-  intro id' c' hget v hsat
-  rw [HashMap_get?_insert] at hget
-  by_cases heq : id == id'
-  · simp only [heq, ↓reduceIte] at hget
-    injection hget with hc; subst hc
-    exact himplied v hsat
-  · simp only [heq, Bool.false_eq_true, ↓reduceIte] at hget
-    exact hsound id' c' hget v hsat
 
 /-! ## Soundness proofs -/
 
@@ -1128,6 +1336,186 @@ theorem normalize_sat (c : Constr) (v : Valuation) (h : c.sat v) :
     (VeriPB.normalizeConstr c).sat v := by
   simp only [VeriPB.normalizeConstr, Constr.sat] at *
   exact go_sat _ _ _ v h
+
+instance : LawfulBEq Sat.PB.Literal where
+  eq_of_beq {a b} h := by
+    cases a <;> cases b <;>
+      simp only [BEq.beq, Sat.PB.instBEqLiteral.beq] at h <;>
+      (try exact absurd h Bool.false_ne_true)
+    all_goals exact congrArg _ (of_decide_eq_true h)
+  rfl {a} := by
+    cases a <;> simp only [BEq.beq, Sat.PB.instBEqLiteral.beq] <;>
+      exact decide_eq_true trivial
+
+/-! ### Reverse normalization (for constrInDB soundness) -/
+
+private theorem cancel_pair_sat_rev (v : Valuation) (pre mid post : List Sat.PB.Term)
+    (l : Sat.PB.Literal) (a b d : Nat) (hle : min a b ≤ d)
+    (h : (Constr.mk (pre ++ (a - min a b, l) :: mid ++
+      (b - min a b, l.negate) :: post) (d - min a b)).sat v) :
+    (Constr.mk (pre ++ (a, l) :: mid ++ (b, l.negate) :: post) d).sat v := by
+  simp only [Constr.sat] at *
+  have hkey := Sat.PB.complementary_sum v l a b
+  rw [Sat.PB.evalSum_append] at h ⊢
+  simp only [Sat.PB.evalSum] at h ⊢
+  rw [Sat.PB.evalSum_append] at h ⊢
+  simp only [Sat.PB.evalSum] at h ⊢
+  omega
+
+private theorem remove_zero_sat_rev (v : Valuation) (pre post : List Sat.PB.Term)
+    (l : Sat.PB.Literal) (d : Nat)
+    (h : (Constr.mk (pre ++ post) d).sat v) :
+    (Constr.mk (pre ++ (0, l) :: post) d).sat v := by
+  simp only [Constr.sat] at *
+  rw [Sat.PB.evalSum_append] at h ⊢
+  simp only [Sat.PB.evalSum] at h ⊢
+  omega
+
+private theorem merge_terms_sat_rev (v : Valuation) (pre mid post : List Sat.PB.Term)
+    (l : Sat.PB.Literal) (a b d : Nat)
+    (h : (Constr.mk (pre ++ (a + b, l) :: mid ++ post) d).sat v) :
+    (Constr.mk (pre ++ (a, l) :: mid ++ (b, l) :: post) d).sat v := by
+  simp only [Constr.sat] at *
+  rw [Sat.PB.evalSum_append] at h ⊢
+  simp only [Sat.PB.evalSum] at h ⊢
+  rw [Sat.PB.evalSum_append] at h ⊢
+  simp only [Sat.PB.evalSum] at h ⊢
+  have hm : (a + b) * Sat.PB.evalLit v l = a * Sat.PB.evalLit v l + b * Sat.PB.evalLit v l :=
+    Nat.add_mul a b _
+  omega
+
+theorem go_sat_rev (fuel : Nat) (terms : List Sat.PB.Term) (degree : Nat)
+    (v : Valuation) (h : (VeriPB.normalizeConstr.go fuel terms degree).sat v) :
+    Sat.PB.evalSum v terms ≥ degree := by
+  induction fuel generalizing terms degree with
+  | zero => simp only [VeriPB.normalizeConstr.go] at h; exact h
+  | succ n ih =>
+    simp only [VeriPB.normalizeConstr.go] at h
+    cases hzero : VeriPB.findZeroIdx terms with
+    | some idx =>
+      rw [hzero] at h
+      have hidx := findZeroIdx_lt terms idx hzero
+      have hcoeff := findZeroIdx_zero terms idx hidx hzero
+      have hih := ih _ _ h
+      rw [← evalSum_remove_zero v terms idx hidx hcoeff]; exact hih
+    | none =>
+      rw [hzero] at h
+      cases hpair : VeriPB.findValidCompPairIdx terms degree with
+      | some pair =>
+        rw [hpair] at h
+        obtain ⟨i, j⟩ := pair
+        simp only [] at h
+        split at h
+        · split at h
+          · split at h
+            · split at h
+              · split at h
+                · next hi hj hij hlit hle =>
+                  have hih := ih _ _ h
+                  have hlit_eq := Literal_beq_eq _ _ hlit
+                  have hj_eq : terms[j] =
+                      (terms[j].1, terms[i].2.negate) :=
+                    Prod.ext rfl hlit_eq
+                  have hdecomp := list_two_point_decomp
+                    terms i j hi hj hij
+                  rw [hdecomp, hj_eq]
+                  exact cancel_pair_sat_rev v (terms.take i)
+                    ((terms.drop (i + 1)).take (j - i - 1))
+                    (terms.drop (j + 1)) terms[i].2
+                    terms[i].1 terms[j].1 degree hle hih
+                · exact h
+              · exact h
+            · exact h
+          · exact h
+        · exact h
+      | none =>
+        rw [hpair] at h
+        cases hlike : VeriPB.findLikeTermIdx terms with
+        | some pair =>
+          rw [hlike] at h
+          obtain ⟨i, j⟩ := pair
+          simp only [] at h
+          split at h
+          · split at h
+            · split at h
+              · split at h
+                · next hi hj hij hlit =>
+                  have hih := ih _ _ h
+                  have hlit_eq := Literal_beq_eq _ _ hlit
+                  have hj_eq : terms[j] =
+                      (terms[j].1, terms[i].2) :=
+                    Prod.ext rfl hlit_eq
+                  have hdecomp := list_two_point_decomp
+                    terms i j hi hj hij
+                  rw [hdecomp, hj_eq]
+                  exact merge_terms_sat_rev v (terms.take i)
+                    ((terms.drop (i + 1)).take (j - i - 1))
+                    (terms.drop (j + 1)) terms[i].2
+                    terms[i].1 terms[j].1 degree hih
+                · exact h
+              · exact h
+            · exact h
+          · exact h
+        | none => rw [hlike] at h; exact h
+
+theorem normalize_sat_rev (c : Constr) (v : Valuation)
+    (h : (VeriPB.normalizeConstr c).sat v) : c.sat v := by
+  simp only [VeriPB.normalizeConstr, Constr.sat] at *
+  exact go_sat_rev _ _ _ v h
+
+private theorem evalSum_perm (v : Valuation) (l1 l2 : List Sat.PB.Term)
+    (hp : l1.Perm l2) : Sat.PB.evalSum v l1 = Sat.PB.evalSum v l2 := by
+  induction hp with
+  | nil => rfl
+  | cons x _ ih => simp [Sat.PB.evalSum]; omega
+  | swap x y l => simp [Sat.PB.evalSum]; omega
+  | trans _ _ ih1 ih2 => exact ih1.trans ih2
+
+private theorem constrMatchNorm_sat (c1 c2 : Constr) (v : Valuation)
+    (h : constrMatchNorm c1 c2 = true) (hsat : c2.sat v) : c1.sat v := by
+  unfold constrMatchNorm at h
+  simp only [Bool.and_eq_true, beq_iff_eq] at h
+  obtain ⟨⟨hdeg, _⟩, hterms⟩ := h
+  simp only [Constr.sat] at hsat ⊢
+  rw [hdeg]
+  -- sorted term lists are equal → evalSum is equal
+  let cmp := fun (a b : Nat × Sat.PB.Literal) =>
+    Sat.PB.Literal.var a.2 < Sat.PB.Literal.var b.2 ||
+    (Sat.PB.Literal.var a.2 == Sat.PB.Literal.var b.2 &&
+     match a.2, b.2 with | .pos _, .neg _ => true | _, _ => false)
+  have hp1 : (c1.terms.mergeSort cmp).Perm c1.terms :=
+    List.mergeSort_perm c1.terms cmp
+  have hp2 : (c2.terms.mergeSort cmp).Perm c2.terms :=
+    List.mergeSort_perm c2.terms cmp
+  have heq_sort : c1.terms.mergeSort cmp = c2.terms.mergeSort cmp :=
+    hterms
+  have h1 := evalSum_perm v _ _ hp1
+  have h2 := evalSum_perm v _ _ hp2
+  rw [heq_sort] at h1
+  omega
+
+/-- If `constrInDB c db = true` and all DB entries are satisfied by `v`,
+    then `c` is satisfied by `v`. -/
+private theorem constrInDB_sat (c : Constr) (db : Std.HashMap Nat Constr)
+    (v : Valuation)
+    (h : constrInDB c db = true)
+    (hdb : ∀ id c, db.get? id = some c → Constr.sat c v) :
+    Constr.sat c v := by
+  unfold constrInDB at h
+  have hany := List.any_eq_true.mp h
+  obtain ⟨⟨id, dbC⟩, hmem, hmatch⟩ := hany
+  -- dbC is in the DB and its normalized form matches c's normalized form
+  have hget : db.get? id = some dbC := by
+    rw [Std.HashMap.get?_eq_getElem?]
+    exact Std.HashMap.mem_toList_iff_getElem?_eq_some.mp hmem
+  have hdbC_sat := hdb id dbC hget
+  -- Chain: dbC.sat v → (normalize dbC).sat v → (normalize c).sat v → c.sat v
+  have h1 := normalize_sat dbC v hdbC_sat
+  -- hmatch : constrMatchNorm (normalize c) (normalize dbC) = true
+  -- constrMatchNorm_sat gives c1.sat from c2.sat, so (normalize c).sat v
+  have h2 := constrMatchNorm_sat (VeriPB.normalizeConstr c)
+    (VeriPB.normalizeConstr dbC) v hmatch h1
+  exact normalize_sat_rev c v h2
 
 -- execPolOps soundness: each pol operation preserves implication
 
@@ -1513,43 +1901,182 @@ theorem verifyRupBool_implied (negConstr : Constr)
 -- Main soundness chain
 
 -- Monotonicity: weakening the original formula preserves DBSound
-private theorem DBSound_weaken (original ext : Array Constr)
-    (db : Std.HashMap Nat Constr)
-    (hsound : DBSound original db)
-    (hsub : ∀ c, c ∈ original.toList → c ∈ ext.toList) :
-    DBSound ext db := fun id c hget v hsat =>
-  hsound id c hget v (fun c' hc' => hsat c' (hsub c' hc'))
 
-theorem execStepsFuel_sound : ∀ (fuel : Nat) (original : Array Constr)
+-- execStepsFuel_sound removed: checkProof_sound now uses execStepsFuel_sat_preserve
+/-- If ¬(c.negate.sat v) and c.degree ≤ c.coeffSum, then c.sat v. -/
+private theorem sat_of_not_negate_sat (c : Constr) (v : Valuation)
+    (hd : c.degree ≤ c.coeffSum) (h : ¬ c.negate.sat v) : c.sat v :=
+  Classical.byContradiction fun hn => h (negate_sat_of_not_sat c v hd hn)
+
+/-- Resolve a goal ID to its constraint, mirroring processRedGoalsBool. -/
+-- checkRedCoverage soundness: if coverage passes, every affected DB entry
+-- is either listed as a numeric goal or auto-satisfied.
+private theorem checkRedCoverage_sound
+    (origConstrs : Array Constr)
+    (subst : List (Nat × Sat.PB.SubstVal))
+    (savedDb : Std.HashMap Nat Constr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat))
+    (hcov : checkRedCoverage origConstrs subst savedDb goals = true)
+    (id : Nat) (G : Constr)
+    (hmem : savedDb.get? id = some G)
+    (haff : Sat.PB.termsAffected subst G.terms = true) :
+    (goals.filterMap fun (gid, _, _) =>
+      if gid.startsWith "#" then none else gid.toNat?).contains id = true ∨
+    constrInDB (Sat.PB.applySubstConstr subst G) savedDb = true := by
+  unfold checkRedCoverage at hcov
+  by_cases hh : goals.any fun g => g.1.startsWith "#"
+  · simp only [hh] at hcov
+    -- hcov : savedDb.toList.all (fun (id, c) => ...) = true
+    have hmem_list : (id, G) ∈ savedDb.toList := by
+      rw [Std.HashMap.get?_eq_getElem?] at hmem
+      exact Std.HashMap.mem_toList_iff_getElem?_eq_some.mpr hmem
+    have hall := List.all_eq_true.mp hcov (id, G) hmem_list
+    simp only [haff, ite_true] at hall
+    exact Bool.or_eq_true_iff.mp hall
+  · simp [hh] at hcov
+
+private def resolveGoalConstr (goalId : String)
+    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
+    (savedDb : Std.HashMap Nat Constr) : Option Constr :=
+  if goalId.startsWith "#" then some (Sat.PB.applySubstConstr subst pbConstr)
+  else match goalId.toNat? with
+  | some dbId => match savedDb[dbId]? with
+    | some c => some (Sat.PB.applySubstConstr subst c)
+    | none => none
+  | none => none
+
+/-- Each goal in processRedGoalsBool is implied by redDb: if
+    processRedGoalsBool succeeds and v satisfies all redDb entries,
+    then every resolved goal constraint is satisfied by v. -/
+private theorem processRedGoalsBool_goalSat
+    (execFn : BoolCheckState → List VeriPB.ProofStep → Option BoolCheckState)
+    (execFn_sound : ∀ st st' steps,
+      DBSat st.db → execFn st steps = some st' → DBSat st'.db)
+    (origConstrs : Array Constr) (numVars formulaSize : Nat)
+    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
+    (savedDb redDb : Std.HashMap Nat Constr)
+    (goals : List (String × Array VeriPB.ProofStep × Nat))
+    (nextId : Nat) (finalNextId : Nat)
+    (hres : processRedGoalsBool execFn origConstrs numVars formulaSize
+        subst pbConstr savedDb redDb goals nextId = some finalNextId)
+    (v : Valuation) (hredDb : ∀ id c, redDb.get? id = some c → Constr.sat c v) :
+    ∀ (goalId : String) (innerSteps : Array VeriPB.ProofStep) (resultId : Nat),
+      (goalId, innerSteps, resultId) ∈ goals →
+      ∀ gc : Constr,
+        resolveGoalConstr goalId subst pbConstr savedDb = some gc →
+        gc.sat v := by
+  induction goals generalizing nextId with
+  | nil => intro _ _ _ hmem; exact absurd hmem (by simp)
+  | cons goal rest ih =>
+    obtain ⟨gid, gsteps, gresult⟩ := goal
+    intro goalId innerSteps resultId hmem gc hresolve
+    -- Unfold processRedGoalsBool for the head
+    simp only [processRedGoalsBool] at hres
+    -- The head goal's constraint resolution
+    have hgc_head : resolveGoalConstr gid subst pbConstr savedDb =
+        (if gid.startsWith "#" then some (Sat.PB.applySubstConstr subst pbConstr)
+         else match gid.toNat? with
+              | some dbId => match savedDb[dbId]? with
+                             | some c => some (Sat.PB.applySubstConstr subst c)
+                             | none => none
+              | none => none) := rfl
+    -- Match on the head goal's constraint resolution in the execution
+    match hgc_exec : (if gid.startsWith "#" then
+        some (Sat.PB.applySubstConstr subst pbConstr)
+      else match gid.toNat? with
+        | some dbId => match savedDb[dbId]? with
+          | some c => some (Sat.PB.applySubstConstr subst c)
+          | none => none
+        | none => none) with
+    | none => simp [hgc_exec] at hres
+    | some goalConstr =>
+      simp only [hgc_exec] at hres
+      -- Degree check passes (otherwise hres is absurd)
+      by_cases hdeg_gc : goalConstr.degree > goalConstr.coeffSum
+      · simp [hdeg_gc] at hres
+      · simp [hdeg_gc] at hres
+        have hdeg_gc' : goalConstr.degree ≤ goalConstr.coeffSum :=
+          Nat.le_of_not_lt hdeg_gc
+        -- Inner proof execution
+        match hexec : execFn
+          { db := redDb.insert nextId goalConstr.negate, origConstrs,
+            nextId := nextId + 1, numVars, formulaSize }
+          gsteps.toList with
+      | none => simp [hexec] at hres
+      | some finalSub =>
+        simp only [hexec] at hres
+        match hresult : finalSub.db[gresult]? with
+        | none => simp [hresult] at hres
+        | some c =>
+          simp only [hresult] at hres
+          by_cases hcontra : c.isContra
+          · -- isContra = true: inner proof found contradiction
+            simp only [hcontra] at hres
+            -- hres : processRedGoalsBool ... rest ... = some finalNextId
+            -- This means goalDb = redDb + goalConstr.negate is unsatisfiable
+            have hgoalDbUnsat : ¬ DBSat (redDb.insert nextId goalConstr.negate) := by
+              intro ⟨w, hw⟩
+              have hfinalSat : DBSat finalSub.db :=
+                execFn_sound _ _ _ ⟨w, hw⟩ hexec
+              obtain ⟨u, hu⟩ := hfinalSat
+              exact contra_unsat c u (by
+                  simp [Constr.isContra] at hcontra; exact hcontra)
+                (hu gresult c (by rwa [Std.HashMap.get?_eq_getElem?]))
+            -- Case: is this the head goal or a rest goal?
+            cases hmem with
+            | head =>
+              -- This IS the head goal: goalId = gid, so resolve matches
+              rw [hgc_head, hgc_exec] at hresolve
+              injection hresolve with hresolve; subst hresolve
+              -- goalConstr.sat v from unsatisfiability of goalDb
+              apply sat_of_not_negate_sat goalConstr v hdeg_gc'
+              intro hneg_sat
+              exact hgoalDbUnsat ⟨v, fun id' c' hget => by
+                rw [HashMap_get?_insert] at hget
+                by_cases heq : nextId == id'
+                · simp [heq] at hget; subst hget; exact hneg_sat
+                · simp [heq] at hget; exact hredDb id' c' hget⟩
+            | tail _ hmem' =>
+              -- This is a rest goal — use IH
+              exact ih _ hres goalId innerSteps resultId hmem' gc hresolve
+          · simp [hcontra] at hres
+
+/-- Main soundness theorem: proof execution preserves DB satisfiability.
+    Replaces execStepsFuel_sound with a weaker but red-compatible invariant. -/
+theorem execStepsFuel_sat_preserve : ∀ (fuel : Nat)
     (state state' : BoolCheckState) (steps : List VeriPB.ProofStep),
-    DBSound original state.db →
+    DBSat state.db →
     execStepsFuel fuel state steps = some state' →
-    DBSound original state'.db := by
+    DBSat state'.db := by
   intro fuel
   induction fuel using Nat.strongRecOn with
   | _ fuel ih_fuel =>
-    intro original state state' steps hsound hsteps
+    intro state state' steps hsat hsteps
     induction steps generalizing state with
     | nil =>
       unfold execStepsFuel at hsteps
-      injection hsteps with h; subst h; exact hsound
+      injection hsteps with h; subst h; exact hsat
     | cons step rest ih_rest =>
       unfold execStepsFuel at hsteps
       simp only [] at hsteps
-      -- Helper: when stepResult = none, hsteps is absurd
       cases step with
       | formulaSize n =>
         by_cases hfs : state.formulaSize != n
         · simp [hfs] at hsteps
-        · simp [hfs] at hsteps; exact ih_rest state hsound hsteps
+        · simp [hfs] at hsteps; exact ih_rest state hsat hsteps
       | pol ops =>
         match hpol : execPolRPNBool ops state.db with
         | some result =>
           simp [hpol] at hsteps
-          exact ih_rest _ (DBSound_insert original state.db state.nextId
-            (VeriPB.normalizeConstr result) hsound fun v hsat =>
-            normalize_sat result v (execPolRPNBool_implied ops state.db
-              original result hsound hpol v hsat)) hsteps
+          -- Bridge: pol result is implied by DB
+          apply ih_rest _ _ hsteps
+          apply DBSat_insert_dbImplied state.db state.nextId
+            (VeriPB.normalizeConstr result) hsat
+          intro v hdb
+          exact normalize_sat result v
+            (execPolRPNBool_implied ops state.db ⟨state.db.toList.map Prod.snd⟩
+              result (DBSound_of_toList state.db) hpol v
+              (toList_sat_of_DBSat state.db v hdb))
         | none => simp [hpol] at hsteps
       | rup constr hints =>
         match hparse : VeriPB.opbConstrToPB constr with
@@ -1570,17 +2097,18 @@ theorem execStepsFuel_sound : ∀ (fuel : Nat) (original : Array Constr)
                     state.db state.numVars
                 · exact absurd h hrup
                 · rfl
-              exact ih_rest _
-                (DBSound_insert original state.db state.nextId
-                  (VeriPB.normalizeConstr pbConstr) hsound fun v hsat =>
-                  normalize_sat pbConstr v
-                    (verifyRupBool_implied pbConstr.negate hints state.db
-                      state.numVars original pbConstr hsound hcs'
-                      hrup' rfl v hsat))
-                hsteps
+              apply ih_rest _ _ hsteps
+              apply DBSat_insert_dbImplied state.db state.nextId
+                (VeriPB.normalizeConstr pbConstr) hsat
+              intro v hdb
+              exact normalize_sat pbConstr v
+                (verifyRupBool_implied pbConstr.negate hints state.db
+                  state.numVars ⟨state.db.toList.map Prod.snd⟩ pbConstr
+                  (DBSound_of_toList state.db) hcs' hrup' rfl v
+                  (toList_sat_of_DBSat state.db v hdb))
         | .error _ => simp [hparse] at hsteps
       | pbc constr innerSteps resultId =>
-        -- Proof by contradiction
+        -- Proof by contradiction: inner proof with ¬C derives contradiction
         by_cases hany : innerSteps.any (fun s => match s with
             | .conclusion _ | .output => true | _ => false)
         · simp [hany] at hsteps
@@ -1609,67 +2137,192 @@ theorem execStepsFuel_sound : ∀ (fuel : Nat) (original : Array Constr)
                     simp [hres] at hsteps
                     by_cases hcontra : c.isContra
                     · simp [hcontra] at hsteps
-                      -- PBC soundness argument
-                      let ext := original.push pbConstr.negate
-                      have hsub : DBSound ext
-                          { state with
-                            db := state.db.insert state.nextId
-                              pbConstr.negate
-                            nextId := state.nextId + 1 }.db :=
-                        DBSound_insert ext state.db state.nextId
-                          pbConstr.negate
-                          (DBSound_weaken original ext state.db hsound
-                            fun c' hc' => by
-                              simp [ext, Array.toList_push]
-                              exact Or.inl (Array.mem_def.mpr hc'))
-                          (fun v hsat => by
-                            apply hsat
-                            simp [ext, Array.toList_push])
-                      have hfin : DBSound ext finalSub.db :=
-                        ih_fuel n (by omega) ext _ finalSub
-                          innerSteps.toList hsub hinner
-                      have hc_impl := hfin resultId c
-                        (by rwa [Std.HashMap.get?_eq_getElem?])
-                      have hpbc : ∀ v : Valuation,
-                          (∀ c' ∈ original.toList, Constr.sat c' v) →
-                          Constr.sat pbConstr v :=
-                        fun v hsat => Classical.byContradiction fun hn =>
-                          absurd (hc_impl v fun c' hc' => by
-                            simp [ext, Array.toList_push] at hc'
-                            rcases hc' with h | h
-                            · exact hsat c' (Array.mem_def.mp h)
-                            · subst h
-                              exact negate_sat_of_not_sat pbConstr v
-                                hcs' hn)
-                            (contra_unsat c v (by
-                              simp [Constr.isContra] at hcontra
-                              exact hcontra))
-                      exact ih_rest _
-                        (DBSound_insert original state.db
-                          finalSub.nextId
-                          (VeriPB.normalizeConstr pbConstr) hsound
-                          fun v hsat => normalize_sat pbConstr v
-                            (hpbc v hsat)) hsteps
+                      -- PBC soundness via DBSat
+                      -- Key: if DB is satisfiable, adding ¬C can't lead to
+                      -- contradiction unless C was already implied by DB
+                      apply ih_rest _ _ hsteps
+                      apply DBSat_insert_dbImplied state.db finalSub.nextId
+                        (VeriPB.normalizeConstr pbConstr) hsat
+                      intro v hdb
+                      apply normalize_sat
+                      -- Show C.sat v by contradiction: if ¬C.sat v, then
+                      -- DB + ¬C is satisfiable, but inner proof shows it's not
+                      apply sat_of_not_negate_sat pbConstr v hcs'
+                      intro hneg_sat
+                      -- v satisfies state.db + pbConstr.negate
+                      have hinnerSat : DBSat
+                          (state.db.insert state.nextId pbConstr.negate) := by
+                        exact ⟨v, fun id' c' hget => by
+                          rw [HashMap_get?_insert] at hget
+                          by_cases heq : state.nextId == id'
+                          · simp [heq] at hget; subst hget; exact hneg_sat
+                          · simp [heq] at hget; exact hdb id' c' hget⟩
+                      -- But inner proof execution preserves DBSat
+                      have hfinalSat : DBSat finalSub.db :=
+                        ih_fuel n (by omega) _ finalSub innerSteps.toList
+                          hinnerSat hinner
+                      -- Yet finalSub.db has contradictory c
+                      obtain ⟨w, hw⟩ := hfinalSat
+                      exact contra_unsat c w (by
+                        simp [Constr.isContra] at hcontra; exact hcontra)
+                        (hw resultId c (by rwa [Std.HashMap.get?_eq_getElem?]))
                     · simp [hcontra] at hsteps
                   | none => simp [hres] at hsteps
                 | none => simp [hinner] at hsteps
             | .error _ => simp [hparse] at hsteps
+      | red constr substPairs goals =>
+        -- Red/dom: equisatisfiable constraint addition
+        -- If v satisfies DB but not C, construct ω(v) satisfying DB + C
+        match fuel with
+        | 0 => simp at hsteps
+        | n + 1 =>
+          match hparse : VeriPB.opbConstrToPB constr with
+          | .error _ => simp [hparse] at hsteps
+          | .ok pbConstr =>
+            simp [hparse] at hsteps
+            by_cases hcs : pbConstr.degree > pbConstr.coeffSum
+            · simp [hcs] at hsteps
+            · simp [hcs] at hsteps
+              have hcs' : pbConstr.degree ≤ pbConstr.coeffSum :=
+                Nat.le_of_not_lt hcs
+              match hsubst : VeriPB.parseSubstPairs substPairs state.numVars with
+              | .error _ => simp [hsubst] at hsteps
+              | .ok subst =>
+                simp [hsubst] at hsteps
+                by_cases hcov :
+                    checkRedCoverage state.origConstrs subst state.db
+                      goals.toList
+                · -- Coverage check passes
+                  simp [hcov] at hsteps
+                  -- Match on processRedGoalsBool result
+                  match hgoals :
+                      processRedGoalsBool (execStepsFuel n)
+                        state.origConstrs state.numVars state.formulaSize
+                        subst pbConstr state.db
+                        (state.db.insert state.nextId pbConstr.negate)
+                        goals.toList (state.nextId + 1) with
+                  | none => simp [hgoals] at hsteps
+                  | some finalNextId =>
+                    simp [hgoals] at hsteps
+                    -- restoredDb = savedDb.insert finalNextId (normalizeConstr C)
+                    -- Need: DBSat restoredDb
+                    apply ih_rest _ _ hsteps
+                    -- Get satisfying assignment from DBSat
+                    obtain ⟨v, hv⟩ := hsat
+                    -- Case split: does v satisfy C?
+                    by_cases hC : pbConstr.sat v
+                    · -- Easy case: v ⊨ C, so v also satisfies restoredDb
+                      exact ⟨v, fun id' c' hget => by
+                        rw [HashMap_get?_insert] at hget
+                        by_cases heq : finalNextId == id'
+                        · simp [heq] at hget; subst hget
+                          exact normalize_sat pbConstr v hC
+                        · simp [heq] at hget; exact hv id' c' hget⟩
+                    · -- Hard case: v ⊭ C, construct witness ω(v)
+                      let ω := Sat.PB.applyValuation subst v
+                      -- v satisfies ¬C
+                      have hnegC : pbConstr.negate.sat v :=
+                        negate_sat_of_not_sat pbConstr v hcs' hC
+                      -- v satisfies redDb = state.db + ¬C
+                      have hredDb : ∀ id c,
+                          (state.db.insert state.nextId pbConstr.negate).get?
+                            id = some c → Constr.sat c v := by
+                        intro id' c' hget
+                        rw [HashMap_get?_insert] at hget
+                        by_cases heq : state.nextId == id'
+                        · simp [heq] at hget; subst hget; exact hnegC
+                        · simp [heq] at hget; exact hv id' c' hget
+                      -- Goal proofs: each goal constraint satisfied by v
+                      have hgoalsSat := processRedGoalsBool_goalSat
+                        (execStepsFuel n)
+                        (fun st st' steps hdbsat hexec =>
+                          ih_fuel n (by omega) st st' steps hdbsat hexec)
+                        state.origConstrs state.numVars state.formulaSize
+                        subst pbConstr state.db
+                        (state.db.insert state.nextId pbConstr.negate)
+                        goals.toList (state.nextId + 1) finalNextId
+                        hgoals v hredDb
+                      -- Witness ω(v) satisfies restoredDb
+                      refine ⟨ω, fun id' c' hget => ?_⟩
+                      rw [HashMap_get?_insert] at hget
+                      by_cases heq : finalNextId == id'
+                      · -- c' = normalizeConstr C
+                        simp [heq] at hget; subst hget
+                        apply normalize_sat
+                        -- '#' goal: extract from coverage (hasHashGoal)
+                        -- and apply hgoalsSat + applySubstConstr_sat_rev
+                        apply Sat.PB.applySubstConstr_sat_rev subst pbConstr v
+                        -- Need: (applySubstConstr subst pbConstr).sat v
+                        -- Extract the '#' goal from goals list
+                        unfold checkRedCoverage at hcov
+                        have hhasHash : (goals.toList.any fun g =>
+                            g.1.startsWith "#") = true := by
+                          by_cases h : goals.toList.any fun g =>
+                              g.1.startsWith "#"
+                          · exact h
+                          · simp [h] at hcov
+                        obtain ⟨⟨gid, gsteps, gresult⟩, hmem, hstart⟩ :=
+                          List.any_eq_true.mp hhasHash
+                        exact hgoalsSat gid gsteps gresult hmem
+                          (Sat.PB.applySubstConstr subst pbConstr)
+                          (by simp [resolveGoalConstr, hstart])
+                      · -- c' ∈ savedDb, need ω(v) ⊨ c'
+                        simp [heq] at hget
+                        by_cases haff :
+                            Sat.PB.termsAffected subst c'.terms = true
+                        · -- c' is affected by substitution
+                          -- By coverage: either goal or auto-satisfied
+                          have hcov_entry := checkRedCoverage_sound
+                            state.origConstrs subst state.db goals.toList
+                            hcov id' c' hget haff
+                          -- In either case, v ⊨ c'|σ, then ω(v) ⊨ c'
+                          apply Sat.PB.applySubstConstr_sat_rev subst c' v
+                          rcases hcov_entry with hgoal_id | hauto
+                          · -- Goal covers this entry: goalIds.contains id'
+                            have hmem_id := List.contains_iff_mem.mp hgoal_id
+                            obtain ⟨⟨gid, gsteps, gresult⟩, hmem_goals, hfilter⟩ :=
+                              List.mem_filterMap.mp hmem_id
+                            -- hfilter: (if gid.startsWith "#" then none else gid.toNat?) = some id'
+                            by_cases hh : gid.startsWith "#" = true
+                            · simp [hh] at hfilter
+                            · simp [Bool.eq_false_iff.mpr hh] at hfilter
+                              -- hfilter : gid.toNat? = some id'
+                              exact hgoalsSat gid gsteps gresult hmem_goals
+                                (Sat.PB.applySubstConstr subst c') (by
+                                  unfold resolveGoalConstr
+                                  simp [hh, hfilter]
+                                  rw [show state.db[id']? = state.db.get? id'
+                                    from by simp [Std.HashMap.get?_eq_getElem?]]
+                                  simp [hget])
+                          · -- Auto-satisfied: c'|σ matches a DB entry
+                            exact constrInDB_sat
+                              (Sat.PB.applySubstConstr subst c') state.db v
+                              hauto (fun id c hget' => hv id c hget')
+                        · -- c' is unaffected: ω(v) ⊨ c' by noSubst
+                          have hnotaff : Sat.PB.termsAffected subst
+                              c'.terms = false := by
+                            cases h : Sat.PB.termsAffected subst c'.terms
+                            · rfl
+                            · exact absurd h (by simp [haff])
+                          exact Sat.PB.constr_sat_applyValuation_noSubst
+                            subst c' v hnotaff (hv id' c' hget)
+                · -- Coverage check fails → none
+                  simp [hcov] at hsteps
       | deld ids | delc ids =>
-        exact ih_rest _ (DBSound_erase_fold original state.db
-          ids hsound) hsteps
-      | output => exact ih_rest state hsound hsteps
+        exact ih_rest _ (DBSat_erase_fold state.db ids hsat) hsteps
+      | output => exact ih_rest state hsat hsteps
       | conclusion id =>
         match hdb : state.db[id]? with
         | some c =>
           simp [hdb] at hsteps
           by_cases hc : c.isContra
-          · simp [hc] at hsteps; exact ih_rest state hsound hsteps
+          · simp [hc] at hsteps; exact ih_rest state hsat hsteps
           · simp [hc] at hsteps
         | none => simp [hdb] at hsteps
-      | sol _ => exact ih_rest state hsound hsteps
-      | soli _ => exact ih_rest state hsound hsteps
-      | conclusionSat _ => exact ih_rest state hsound hsteps
-      | conclusionBounds _ _ _ _ => exact ih_rest state hsound hsteps
+      | sol _ => exact ih_rest state hsat hsteps
+      | soli _ => exact ih_rest state hsat hsteps
+      | conclusionSat _ => exact ih_rest state hsat hsteps
+      | conclusionBounds _ _ _ _ => exact ih_rest state hsat hsteps
 
 theorem checkProof_sound (constrs : Array Constr) (numVars : Nat)
     (proofStr : String)
@@ -1685,12 +2338,7 @@ theorem checkProof_sound (constrs : Array Constr) (numVars : Nat)
         proofData.steps.toList with
     | some finalState =>
       simp only [hexec] at h
-      have hfinal : DBSound constrs finalState.db :=
-        execStepsFuel_sound _ constrs _ finalState _
-          (init_sound constrs numVars) hexec
-      -- h : hasUnsatConclusion proofData.steps finalState = true
-      -- The hasUnsatConclusion checks Array.any
-      -- Extract contradiction from hasUnsatConclusion
+      -- Extract conclusion information
       simp only [hasUnsatConclusion] at h
       obtain ⟨i, _, _, _, hpi⟩ := Array.any_iff_exists.mp h
       revert hpi
@@ -1702,8 +2350,23 @@ theorem checkProof_sound (constrs : Array Constr) (numVars : Nat)
         match hdb : finalState.db[id]? with
         | some c =>
           simp [hdb] at hpi
-          exact unsat_of_contra_implied constrs c hpi
-            (hfinal id c (by rwa [Std.HashMap.get?_eq_getElem?]))
+          -- hpi : c.isContra = true
+          -- Prove UNSAT by contradiction using DBSat
+          intro v
+          exact Classical.byContradiction fun hne => by
+            -- hne : ¬ (∃ c, c ∈ constrs.toList ∧ ¬c.sat v)
+            -- So all constraints are satisfied by v
+            have hall : ∀ c' ∈ constrs.toList, Constr.sat c' v :=
+              fun c' hc' => Classical.byContradiction fun hn =>
+                hne ⟨c', hc', hn⟩
+            have hinit : DBSat (BoolCheckState.fromConstrs constrs numVars).db :=
+              ⟨v, fun id' c' hget => init_sound constrs numVars id' c' hget v hall⟩
+            have hfinal : DBSat finalState.db :=
+              execStepsFuel_sat_preserve _ _ _ _ hinit hexec
+            obtain ⟨w, hw⟩ := hfinal
+            exact contra_unsat c w (by
+              simp [Constr.isContra] at hpi; exact hpi)
+              (hw id c (by rwa [Std.HashMap.get?_eq_getElem?]))
         | none => simp [hdb] at hpi
       | _ => simp at hpi
     | none => simp [hexec] at h

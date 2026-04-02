@@ -428,4 +428,268 @@ ramsey_reflect ramsey6_impossible 6
 theorem ramsey_3_3 : ramseyNumber 5 :=
   ⟨ramsey5_exists, ramsey6_impossible⟩
 
+-- ============================================================
+-- Asymmetric Ramsey R(s,t): no red K_s, no blue K_t
+-- ============================================================
+
+/-- All s-subsets of {0,...,n-1}. -/
+def subsets : Nat → Nat → List (List Nat)
+  | _, 0 => [[]]
+  | 0, _ + 1 => []
+  | n + 1, s + 1 =>
+    (subsets n (s)).map (n :: ·) ++ subsets n (s + 1)
+
+/-- Edge variables for a clique (list of vertices). -/
+def cliqueEdgeVars (n : Nat) (vs : List Nat) : List Nat :=
+  vs.flatMap fun i =>
+    vs.filterMap fun j =>
+      if i < j then some (edgeVar n i j) else none
+
+/-- Asymmetric Ramsey encoding: no red K_s (all edges true)
+    and no blue K_t (all edges false). -/
+def encodeAsym (n s t : Nat) : Array Constr :=
+  let sCliques := subsets n s
+  let tCliques := subsets n t
+  let noRedKs := sCliques.flatMap fun vs =>
+    let evars := cliqueEdgeVars n vs
+    [⟨evars.map fun v => (1, Literal.neg v), 1⟩]
+  let noBlueKt := tCliques.flatMap fun vs =>
+    let evars := cliqueEdgeVars n vs
+    [⟨evars.map fun v => (1, Literal.pos v), 1⟩]
+  (noRedKs ++ noBlueKt).toArray
+
+-- Mathematical predicate for asymmetric Ramsey
+
+/-- A 2-coloring f of K_n has no red K_s: no s-clique with all
+    edges true. -/
+def noRedClique (n s : Nat) (f : Nat → Bool) : Prop :=
+  ∀ vs : List Nat, vs.length = s →
+    (∀ v ∈ vs, v < n) →
+    vs.Nodup →
+    ¬(∀ i j, i ∈ vs → j ∈ vs → i < j →
+      f (edgeVar n i j) = true)
+
+/-- A 2-coloring f of K_n has no blue K_t: no t-clique with all
+    edges false. -/
+def noBlueClique (n t : Nat) (f : Nat → Bool) : Prop :=
+  ∀ vs : List Nat, vs.length = t →
+    (∀ v ∈ vs, v < n) →
+    vs.Nodup →
+    ¬(∀ i j, i ∈ vs → j ∈ vs → i < j →
+      f (edgeVar n i j) = false)
+
+/-- Asymmetric Ramsey-free: no red K_s and no blue K_t. -/
+def isAsymRamseyFree (n s t : Nat) (f : Nat → Bool) : Prop :=
+  noRedClique n s f ∧ noBlueClique n t f
+
+def hasAsymRamseyFreeColoring (n s t : Nat) : Prop :=
+  ∃ f : Nat → Bool, isAsymRamseyFree n s t f
+
+-- Soundness of asymmetric encoding
+
+private theorem cliqueEdgeVars_complete (n : Nat) (vs : List Nat)
+    (i j : Nat) (hi : i ∈ vs) (hj : j ∈ vs) (hij : i < j) :
+    edgeVar n i j ∈ cliqueEdgeVars n vs := by
+  simp only [cliqueEdgeVars, List.mem_flatMap, List.mem_filterMap]
+  exact ⟨i, hi, j, hj, by simp [hij]⟩
+
+private theorem not_all_has_false (l : List Nat) (f : Nat → Bool)
+    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = true))
+    (hl : l.length ≥ 2) :
+    ∃ v ∈ cliqueEdgeVars n l, f v = false := by
+  have hdiff : ∃ i j, i ∈ l ∧ j ∈ l ∧ i < j ∧ f (edgeVar n i j) ≠ true :=
+    Classical.byContradiction fun hall =>
+      h fun i j hi hj hij =>
+        Classical.byContradiction fun hne =>
+          hall ⟨i, j, hi, hj, hij, hne⟩
+  obtain ⟨i, j, hi, hj, hij, hne⟩ := hdiff
+  have hf : f (edgeVar n i j) = false := by
+    cases hc : f (edgeVar n i j)
+    · rfl
+    · exact absurd hc hne
+  exact ⟨edgeVar n i j, cliqueEdgeVars_complete n l i j hi hj hij, hf⟩
+
+private theorem not_all_has_true (l : List Nat) (f : Nat → Bool)
+    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = false))
+    (hl : l.length ≥ 2) :
+    ∃ v ∈ cliqueEdgeVars n l, f v = true := by
+  have hdiff : ∃ i j, i ∈ l ∧ j ∈ l ∧ i < j ∧ f (edgeVar n i j) ≠ false :=
+    Classical.byContradiction fun hall =>
+      h fun i j hi hj hij =>
+        Classical.byContradiction fun hne =>
+          hall ⟨i, j, hi, hj, hij, hne⟩
+  obtain ⟨i, j, hi, hj, hij, hne⟩ := hdiff
+  have hf : f (edgeVar n i j) = true := by
+    cases hc : f (edgeVar n i j)
+    · exact absurd hc hne
+    · rfl
+  exact ⟨edgeVar n i j, cliqueEdgeVars_complete n l i j hi hj hij, hf⟩
+
+private theorem evalSum_neg_map_ge_one' (f : Valuation)
+    (vars : List Nat) (v : Nat) (hv : v ∈ vars) (hf : f v = false) :
+    1 ≤ evalSum f (vars.map fun v => (1, Literal.neg v)) := by
+  induction vars with
+  | nil => exact absurd hv (List.not_mem_nil)
+  | cons hd tl ih =>
+    simp only [List.map_cons, evalSum]
+    rcases List.mem_cons.mp hv with rfl | htl
+    · simp [evalLit, hf]
+    · have := ih htl; omega
+
+private theorem evalSum_pos_map_ge_one' (f : Valuation)
+    (vars : List Nat) (v : Nat) (hv : v ∈ vars) (hf : f v = true) :
+    1 ≤ evalSum f (vars.map fun v => (1, Literal.pos v)) := by
+  induction vars with
+  | nil => exact absurd hv (List.not_mem_nil)
+  | cons hd tl ih =>
+    simp only [List.map_cons, evalSum]
+    rcases List.mem_cons.mp hv with rfl | htl
+    · simp [evalLit, hf]
+    · have := ih htl; omega
+
+private theorem subsets_valid (n s : Nat) (vs : List Nat)
+    (hvs : vs ∈ subsets n s) :
+    vs.length = s ∧ (∀ v ∈ vs, v < n) ∧ vs.Nodup := by
+  induction n generalizing s vs with
+  | zero =>
+    match s with
+    | 0 => simp [subsets] at hvs; subst hvs; exact ⟨rfl, nofun, .nil⟩
+    | _ + 1 => simp [subsets] at hvs
+  | succ n ih =>
+    match s with
+    | 0 => simp [subsets] at hvs; subst hvs; exact ⟨rfl, nofun, .nil⟩
+    | s + 1 =>
+      simp only [subsets, List.mem_append, List.mem_map] at hvs
+      rcases hvs with ⟨tl, htl, rfl⟩ | hvs
+      · obtain ⟨hlen, hbound, hnodup⟩ := ih s tl htl
+        refine ⟨by simp [hlen], ?_, ?_⟩
+        · intro v hv
+          rcases List.mem_cons.mp hv with rfl | hvtl
+          · omega
+          · exact Nat.lt_succ_of_lt (hbound v hvtl)
+        · rw [List.nodup_cons]
+          exact ⟨fun hmem => Nat.lt_irrefl n (hbound n hmem), hnodup⟩
+      · obtain ⟨hlen, hbound, hnodup⟩ := ih (s + 1) vs hvs
+        exact ⟨hlen, fun v hv => Nat.lt_succ_of_lt (hbound v hv), hnodup⟩
+
+private theorem red_constr_sat (n s : Nat) (f : Valuation)
+    (vs : List Nat) (hvs : vs ∈ subsets n s) (hs : s ≥ 2)
+    (hfree : noRedClique n s f) :
+    (⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.neg v), 1⟩ :
+      Constr).sat f := by
+  simp only [Constr.sat]
+  obtain ⟨hlen, hbound, hsorted⟩ := subsets_valid n s vs hvs
+  have hno := hfree vs hlen hbound hsorted
+  obtain ⟨v, hv, hvf⟩ := not_all_has_false vs f hno (by omega)
+  exact evalSum_neg_map_ge_one' f _ v hv hvf
+
+private theorem blue_constr_sat (n t : Nat) (f : Valuation)
+    (vs : List Nat) (hvs : vs ∈ subsets n t) (ht : t ≥ 2)
+    (hfree : noBlueClique n t f) :
+    (⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.pos v), 1⟩ :
+      Constr).sat f := by
+  simp only [Constr.sat]
+  obtain ⟨hlen, hbound, hsorted⟩ := subsets_valid n t vs hvs
+  have hno := hfree vs hlen hbound hsorted
+  obtain ⟨v, hv, hvf⟩ := not_all_has_true vs f hno (by omega)
+  exact evalSum_pos_map_ge_one' f _ v hv hvf
+
+private theorem encodeAsym_mem (n s t : Nat) (c : Constr)
+    (hc : c ∈ (encodeAsym n s t).toList) :
+    (∃ vs ∈ subsets n s,
+      c = ⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.neg v), 1⟩) ∨
+    (∃ vs ∈ subsets n t,
+      c = ⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.pos v), 1⟩) := by
+  have : (encodeAsym n s t).toList =
+      ((subsets n s).flatMap fun vs =>
+        [⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.neg v), 1⟩]) ++
+      ((subsets n t).flatMap fun vs =>
+        [⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.pos v), 1⟩]) := by
+    simp [encodeAsym]
+  rw [this] at hc
+  simp only [List.mem_append, List.mem_flatMap,
+    List.mem_cons, List.mem_nil_iff, or_false] at hc
+  rcases hc with ⟨vs, hvs, rfl⟩ | ⟨vs, hvs, rfl⟩
+  · exact Or.inl ⟨vs, hvs, rfl⟩
+  · exact Or.inr ⟨vs, hvs, rfl⟩
+
+theorem no_asym_ramsey_of_unsat (n s t : Nat) (hs : s ≥ 2) (ht : t ≥ 2)
+    (hunsat : ∀ v : Valuation,
+      ∃ c ∈ (encodeAsym n s t).toList, ¬c.sat v) :
+    ¬hasAsymRamseyFreeColoring n s t := by
+  intro ⟨f, hred, hblue⟩
+  obtain ⟨c, hc, hnsat⟩ := hunsat f
+  apply hnsat
+  rcases encodeAsym_mem n s t c hc with
+    ⟨vs, hvs, rfl⟩ | ⟨vs, hvs, rfl⟩
+  · exact red_constr_sat n s f vs hvs hs hred
+  · exact blue_constr_sat n t f vs hvs ht hblue
+
+-- Reflection command for asymmetric Ramsey
+elab "ramsey_asym_reflect " nm:ident ppSpace nTerm:num
+    ppSpace sTerm:num ppSpace tTerm:num
+    ppSpace proofFile:str : command => do
+  let name := (← getCurrNamespace) ++ nm.getId
+  let n := nTerm.getNat
+  let s := sTerm.getNat
+  let t := tTerm.getNat
+  let proofPath := proofFile.getString
+  liftTermElabM do
+    let nExpr := mkRawNatLit n
+    let sExpr := mkRawNatLit s
+    let tExpr := mkRawNatLit t
+    let numVars := numEdgeVars n
+    let numVarsExpr := mkRawNatLit numVars
+    let proofStr ← IO.FS.readFile (System.FilePath.mk proofPath)
+    let constrsExpr := mkApp3 (mkConst ``encodeAsym) nExpr sExpr tExpr
+    let proofStrExpr := mkStrLit proofStr
+    let checkExpr := mkApp3
+      (mkConst ``VeriPB.Reflect.checkProofBool)
+      constrsExpr numVarsExpr proofStrExpr
+    let auxName := name ++ `_check
+    addAndCompile <| .defnDecl {
+      name := auxName
+      levelParams := []
+      type := mkConst ``Bool
+      value := checkExpr
+      hints := .abbrev
+      safety := .safe
+    }
+    let auxConst := mkConst auxName
+    let reduceBoolApp := mkApp (mkConst ``Lean.reduceBool) auxConst
+    let rflPrf := mkApp2 (mkConst ``Eq.refl [.succ .zero])
+      (mkConst ``Bool) reduceBoolApp
+    let hEqTrue := mkApp3 (mkConst ``Lean.ofReduceBool)
+      auxConst (mkConst ``Bool.true) rflPrf
+    let unsatProof := mkApp4
+      (mkConst ``VeriPB.Reflect.checkProof_sound)
+      constrsExpr numVarsExpr proofStrExpr hEqTrue
+    -- Build side-condition proofs: s ≥ 2, t ≥ 2
+    if s < 2 then throwError "s must be ≥ 2"
+    if t < 2 then throwError "t must be ≥ 2"
+    let hsType := mkApp4 (mkConst ``LE.le [.zero])
+      (mkConst ``Nat) (mkConst ``instLENat) (mkRawNatLit 2) sExpr
+    let hsProof ← mkDecideProof hsType
+    let htType := mkApp4 (mkConst ``LE.le [.zero])
+      (mkConst ``Nat) (mkConst ``instLENat) (mkRawNatLit 2) tExpr
+    let htProof ← mkDecideProof htType
+    let finalProof := mkApp6
+      (mkConst ``no_asym_ramsey_of_unsat)
+      nExpr sExpr tExpr hsProof htProof unsatProof
+    let finalType := mkApp (mkConst ``Not)
+      (mkApp3 (mkConst ``hasAsymRamseyFreeColoring) nExpr sExpr tExpr)
+    addDecl <| Declaration.thmDecl {
+      name
+      levelParams := []
+      type := finalType
+      value := finalProof
+    }
+    Lean.logInfo
+      m!"Registered {name} : ¬ hasAsymRamseyFreeColoring {n} {s} {t}"
+
+-- R(3,4) upper bound: K_9 has no 2-coloring avoiding red K_3 and blue K_4
+-- 36 edge variables, 210 constraints (84 no-red-triangle + 126 no-blue-K_4)
+ramsey_asym_reflect ramsey9_34_impossible 9 3 4
+  "applications/ramsey/ramsey9_34_kernel.pbp"
+
 end Ramsey

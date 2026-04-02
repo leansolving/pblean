@@ -236,6 +236,9 @@ inductive ProofStep where
   | deld (ids : List Nat)                          -- `deld ids ;`
   | delc (ids : List Nat)                          -- `delc ids ;`
   | pbc (constr : OPBConstr) (steps : Array ProofStep) (resultId : Nat)
+  | red (constr : OPBConstr) (subst : List (String × String))
+        (goals : Array (String × Array ProofStep × Nat))
+        -- goals: (goalId, inner steps, result constraint id)
   | output                                         -- `output NONE ;`
   | conclusion (id : Nat)                          -- `conclusion UNSAT : id ;`
   | sol (lits : List OPBLit)                       -- `sol lits ;`
@@ -265,6 +268,51 @@ def parseOPBLit (tok : String) : Except String OPBLit :=
       throw "empty variable name"
     else
       .ok (.pos tok)
+
+/-- Convert a variable name like "x3" to a 0-based variable index. -/
+def varNameToIdx (varName : String) : Except String Nat :=
+  if varName.startsWith "x" then
+    match (varName.drop 1).toString.toNat? with
+    | some n => if n > 0 then .ok (n - 1)
+                else .error "variable index must be > 0"
+    | none => .error s!"invalid variable name: {varName}"
+  else .error s!"expected variable name starting with 'x', got: {varName}"
+
+/-- Convert raw substitution string pairs to kernel-level (Nat x SubstVal). -/
+def parseSubstPairs (pairs : List (String × String)) (numVars : Nat) :
+    Except String (List (Nat × Sat.PB.SubstVal)) :=
+  let rec go (remaining : List (String × String))
+      (seen : Std.HashSet Nat) (acc : List (Nat × Sat.PB.SubstVal)) :
+      Except String (List (Nat × Sat.PB.SubstVal)) :=
+    match remaining with
+    | [] => .ok acc
+    | (varStr, valStr) :: rest => do
+      let varIdx ← varNameToIdx varStr
+      if varIdx >= numVars then
+        .error s!"substitution variable {varStr} (index {varIdx}) out of range \
+          (numVars={numVars})"
+      else if seen.contains varIdx then
+        .error s!"duplicate substitution for variable {varStr} (index {varIdx})"
+      else
+        let sv : Sat.PB.SubstVal ←
+          if valStr == "0" then .ok .zero
+          else if valStr == "1" then .ok .one
+          else match parseOPBLit valStr with
+          | .ok (.pos vn) => do
+            let j ← varNameToIdx vn
+            if j >= numVars then
+              .error s!"substitution target {vn} (index {j}) out of range \
+                (numVars={numVars})"
+            else .ok (.posLit j)
+          | .ok (.neg vn) => do
+            let j ← varNameToIdx vn
+            if j >= numVars then
+              .error s!"substitution target ~{vn} (index {j}) out of range \
+                (numVars={numVars})"
+            else .ok (.negLit j)
+          | .error e => .error s!"invalid substitution value '{valStr}': {e}"
+        go rest (seen.insert varIdx) (acc ++ [(varIdx, sv)])
+  go pairs ∅ []
 
 /-- Check if a token looks like a variable name (starts with letter or ~). -/
 def isVarToken (tok : String) : Bool :=
@@ -477,12 +525,65 @@ partial def parseStep : ParseM ProofStep := do
     let resultId ← parseNat
     expectSemicolon
     return .pbc constr innerSteps resultId
-  | "red" =>
-    throw ("unsupported proof step 'red' (redundancy). " ++
-      "Run VeriPB with --elaborate to convert to kernel format first.")
-  | "dom" =>
-    throw ("unsupported proof step 'dom' (dominance). " ++
-      "Run VeriPB with --elaborate to convert to kernel format first.")
+  | "red" | "dom" =>
+    -- Parse constraint
+    let constr ← parseOPBConstr
+    -- Expect `:` separator before substitution
+    expect ":"
+    -- Parse substitution: pairs of `varName -> value` until `:` or `;`
+    let mut substPairs : List (String × String) := []
+    while (← peek) != ":" && (← peek) != ";" do
+      let varTok ← next
+      -- Check for `->` separator (VeriPB uses `->`)
+      if (← peek) == "->" then
+        let _ ← next  -- consume `->`
+        let valTok ← next
+        substPairs := (varTok, valTok) :: substPairs
+      else
+        -- VeriPB also allows `var val` without `->`
+        let valTok ← next
+        substPairs := (varTok, valTok) :: substPairs
+    substPairs := substPairs.reverse
+    -- Check if there is an explicit subproof
+    if (← peek) == ";" then
+      -- No subproof (all goals autoproved) — not supported in our checker
+      expectSemicolon
+      return .red constr substPairs #[]
+    else
+      -- Expect `:` then `subproof` or `begin`
+      expect ":"
+      let kw ← next
+      if kw != "subproof" && kw != "begin" then
+        throw s!"expected 'subproof' or 'begin' in red step, got '{kw}'"
+      -- Optional semicolon after subproof keyword
+      if (← peek) == ";" then let _ ← next
+      -- Parse proof goals until outer `qed`
+      let mut goals : Array (String × Array ProofStep × Nat) := #[]
+      while (← peek) != "qed" do
+        let goalKw ← next
+        if goalKw != "proofgoal" then
+          throw s!"expected 'proofgoal' in red subproof, got '{goalKw}'"
+        let goalId ← next  -- `#1` or a constraint ID number
+        -- Parse inner steps until `qed` (the proofgoal's qed)
+        let mut innerSteps : Array ProofStep := #[]
+        while (← peek) != "qed" && (← peek) != "end" do
+          let step ← parseStep
+          innerSteps := innerSteps.push step
+        -- Expect `qed` or `end` for this proofgoal
+        let endKw ← next
+        if endKw != "qed" && endKw != "end" then
+          throw s!"expected 'qed' or 'end' in proofgoal, got '{endKw}'"
+        -- Expect `:` then result ID
+        expect ":"
+        let resultId ← parseNat
+        -- Optional semicolon
+        if (← peek) == ";" then let _ ← next
+        goals := goals.push (goalId, innerSteps, resultId)
+      -- Consume the outer `qed`
+      expect "qed"
+      -- Optional semicolon after outer qed
+      if (← peek) == ";" then let _ ← next
+      return .red constr substPairs goals
   | "ia" =>
     throw ("unsupported proof step 'ia' (implication addition). " ++
       "Run VeriPB with --elaborate to convert to kernel format first.")
@@ -621,13 +722,15 @@ private def normalizeConstrFast (c : Sat.PB.Constr) : Sat.PB.Constr :=
       else match m[lit]? with
         | some old => m.insert lit (old + coeff)
         | none     => m.insert lit coeff) ∅
-  -- Phase 2: collect unique variable indices
-  let vars : Std.HashSet Nat :=
-    merged.fold (fun s lit _ => s.insert lit.var) ∅
+  -- Phase 2: collect unique variable indices, sorted for deterministic order
+  let vars : Array Nat :=
+    (merged.fold (fun (s : Std.HashSet Nat) lit _ => s.insert lit.var) ∅).fold
+      (fun (a : Array Nat) v => a.push v) #[]
+  let vars := vars.qsort (· < ·)
   -- Phase 3: cancel complementary pairs, build result
   let initAcc : List Sat.PB.Term × Nat := ([], c.degree)
   let (resultTerms, resultDeg) :=
-    vars.fold (fun (acc : List Sat.PB.Term × Nat) v =>
+    vars.foldl (fun (acc : List Sat.PB.Term × Nat) v =>
       let posLit := Sat.PB.Literal.pos v
       let negLit := Sat.PB.Literal.neg v
       let posCoeff := merged[posLit]?.getD 0
@@ -990,6 +1093,18 @@ def execPolRPN (ops : List PolOp) (db : Std.HashMap Nat Sat.PB.Constr) :
 
 -- Proof step executor (data-level checking)
 
+/-- Compare two normalized constraints by sorting terms. -/
+private def constrMatchNorm (c1 c2 : Sat.PB.Constr) : Bool :=
+  c1.degree == c2.degree && c1.terms.length == c2.terms.length &&
+  let sort := fun (ts : List Sat.PB.Term) =>
+    ts.mergeSort fun a b =>
+      Sat.PB.Literal.var a.2 < Sat.PB.Literal.var b.2 ||
+      (Sat.PB.Literal.var a.2 == Sat.PB.Literal.var b.2 &&
+       match a.2, b.2 with
+       | .pos _, .neg _ => true
+       | _, _ => false)
+  sort c1.terms == sort c2.terms
+
 mutual
 /-- Execute a single proof step, updating the check state. -/
 partial def execStep (state : CheckState) (step : ProofStep) : Except String CheckState :=
@@ -1039,6 +1154,66 @@ partial def execStep (state : CheckState) (step : ProofStep) : Except String Che
     -- Restore DB, register the derived constraint
     let restoredDb := savedDb.insert finalSub.nextId (normalizeConstr pbConstr)
     .ok { state with db := restoredDb, nextId := finalSub.nextId + 1 }
+  | .red constr substPairs goals => do
+    let pbConstr ← opbConstrToPB constr
+    let cs := pbConstr.coeffSum
+    if pbConstr.degree > cs then
+      throw s!"red: target degree {pbConstr.degree} > coeffSum {cs}"
+    -- Convert substitution pairs to kernel-level SubstVal
+    let subst ← parseSubstPairs substPairs state.numVars
+    -- Save DB snapshot, add negated constraint
+    let savedDb := state.db
+    -- Coverage check: must have '#' goal and all affected constraints covered
+    let hasHashGoal := goals.any fun (gid, _, _) => gid.startsWith "#"
+    if !hasHashGoal then
+      throw "red: missing '#' goal for the new constraint"
+    let goalIds := goals.toList.filterMap fun (gid, _, _) =>
+      if gid.startsWith "#" then none else gid.toNat?
+    for (id, c) in savedDb.toList do
+      if Sat.PB.termsAffected subst c.terms then
+        let nc := normalizeConstr (Sat.PB.applySubstConstr subst c)
+        let autoSat := savedDb.toList.any fun (_, dbC) =>
+          constrMatchNorm nc (normalizeConstr dbC)
+        let covered := goalIds.contains id || autoSat
+        if !covered then
+          throw s!"red: affected constraint {id} not covered by goals or auto-satisfied"
+    let negConstr := pbConstr.negate
+    let negId := state.nextId
+    let redDb := state.db.insert negId negConstr
+    -- Process each proof goal
+    let mut nextId := negId + 1
+    for (goalId, innerSteps, resultId) in goals do
+      -- Determine the goal constraint: apply substitution
+      let goalConstr ← if goalId.startsWith "#" then
+        -- proofgoal #N: refers to the new constraint C itself
+        pure (Sat.PB.applySubstConstr subst pbConstr)
+      else match goalId.toNat? with
+      | some dbId =>
+        match savedDb[dbId]? with
+        | some c => pure (Sat.PB.applySubstConstr subst c)
+        | none => throw s!"red proofgoal {goalId}: constraint not in database"
+      | none => throw s!"red proofgoal: invalid goal ID '{goalId}'"
+      -- Reject unsatisfiable goal constraints (negate requires degree ≤ coeffSum)
+      if goalConstr.degree > goalConstr.coeffSum then
+        throw s!"red proofgoal {goalId}: goal degree {goalConstr.degree} > \
+          coeffSum {goalConstr.coeffSum}"
+      -- Add negated goal constraint to the red context DB
+      let goalNeg := Sat.PB.Constr.negate goalConstr
+      let goalDb := redDb.insert nextId goalNeg
+      let subState : CheckState :=
+        { state with db := goalDb, nextId := nextId + 1 }
+      -- Execute inner steps for this proof goal
+      let finalSub ← execAllSteps subState innerSteps
+      -- Check that the result is contradictory
+      match finalSub.db[resultId]? with
+      | some c =>
+        if c.isContra then pure ()
+        else throw s!"red proofgoal {goalId}: result {resultId} not contradictory"
+      | none => throw s!"red proofgoal {goalId}: result {resultId} not in database"
+      nextId := finalSub.nextId
+    -- All goals passed: add the derived constraint
+    let restoredDb := savedDb.insert nextId (normalizeConstr pbConstr)
+    .ok { state with db := restoredDb, nextId := nextId + 1 }
   | .deld ids =>
     let db := ids.foldl (init := state.db) fun db id => db.erase id
     .ok { state with db := db }
@@ -1756,6 +1931,8 @@ partial def execInnerSteps (db : Std.HashMap Nat StoredConstr)
         db ctx nextId numVars
       db := db.insert newNextId sc
       nextId := newNextId + 1
+    | .red _ _ _ =>
+      throw "red steps in Expr-building mode not yet supported; use reflection checker"
     | .deld ids =>
       for id in ids do db := db.erase id
     | .delc ids =>

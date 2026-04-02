@@ -659,4 +659,221 @@ theorem Constr.Reify_cnf_one {l : Literal} {a : Prop}
 
 end Reification
 
+-- Substitution infrastructure for redundance-based strengthening
+
+section Substitution
+
+/-- A substitution value: what a variable maps to under witness omega. -/
+inductive SubstVal where
+  | zero : SubstVal       -- variable maps to 0 (false)
+  | one : SubstVal        -- variable maps to 1 (true)
+  | posLit : Nat → SubstVal -- variable maps to another variable
+  | negLit : Nat → SubstVal -- variable maps to negation of variable
+  deriving Repr, BEq, Inhabited
+
+/-- Look up a variable in a substitution list. -/
+def lookupSubst (subst : List (Nat × SubstVal)) (var : Nat) :
+    Option SubstVal :=
+  match subst with
+  | [] => none
+  | (v, sv) :: rest => if v == var then some sv else lookupSubst rest var
+
+/-- Apply a substitution to a single literal.
+    Returns (constant_contribution, optional_remaining_term).
+    If the variable is substituted to 0/1, the term becomes a constant.
+    If substituted to another literal, the term is rewritten. -/
+def applySubstTerm (subst : List (Nat × SubstVal))
+    (a : Nat) (l : Literal) : Nat × Option Term :=
+  match lookupSubst subst l.var with
+  | none => (0, some (a, l))
+  | some .zero => match l with
+    | .pos _ => (0, none)
+    | .neg _ => (a, none)
+  | some .one => match l with
+    | .pos _ => (a, none)
+    | .neg _ => (0, none)
+  | some (.posLit j) => match l with
+    | .pos _ => (0, some (a, .pos j))
+    | .neg _ => (0, some (a, .neg j))
+  | some (.negLit j) => match l with
+    | .pos _ => (0, some (a, .neg j))
+    | .neg _ => (0, some (a, .pos j))
+
+/-- Constant sum accumulated when applying substitution to a term list. -/
+def substConstSum (subst : List (Nat × SubstVal)) :
+    List Term → Nat
+  | [] => 0
+  | (a, l) :: rest =>
+    (applySubstTerm subst a l).1 + substConstSum subst rest
+
+/-- Remaining terms after applying substitution to a term list. -/
+def substRemainingTerms (subst : List (Nat × SubstVal)) :
+    List Term → List Term
+  | [] => []
+  | (a, l) :: rest =>
+    match (applySubstTerm subst a l).2 with
+    | none => substRemainingTerms subst rest
+    | some t => t :: substRemainingTerms subst rest
+
+/-- Apply a substitution to a constraint: substitute variables,
+    accumulate constants, adjust degree. -/
+def applySubstConstr (subst : List (Nat × SubstVal))
+    (c : Constr) : Constr :=
+  let k := substConstSum subst c.terms
+  ⟨substRemainingTerms subst c.terms, c.degree - min c.degree k⟩
+
+/-- Apply a substitution to a valuation: use omega for mapped variables,
+    original valuation for unmapped ones. -/
+def applyValuation (subst : List (Nat × SubstVal))
+    (v : Valuation) : Valuation :=
+  fun i => match lookupSubst subst i with
+  | none => v i
+  | some .zero => false
+  | some .one => true
+  | some (.posLit j) => v j
+  | some (.negLit j) => !(v j)
+
+/-- Each term evaluates identically under the substituted valuation and
+    the decomposed (constant + remaining) form. -/
+private theorem applySubstTerm_eval (subst : List (Nat × SubstVal))
+    (v : Valuation) (a : Nat) (l : Literal) :
+    a * evalLit (applyValuation subst v) l =
+    (applySubstTerm subst a l).1 +
+    match (applySubstTerm subst a l).2 with
+    | none => 0
+    | some (a', l') => a' * evalLit v l' := by
+  unfold applySubstTerm applyValuation evalLit Literal.var
+  cases l with
+  | pos i =>
+    cases h : lookupSubst subst i <;> simp [h]
+    case some sv => cases sv <;> simp
+                    case negLit j => cases v j <;> simp
+  | neg i =>
+    cases h : lookupSubst subst i <;> simp [h]
+    case some sv => cases sv <;> simp
+                    case negLit j => cases v j <;> simp
+
+/-- evalSum under substituted valuation = substConstSum + evalSum of remaining. -/
+theorem evalSum_subst (subst : List (Nat × SubstVal))
+    (v : Valuation) (ts : List Term) :
+    evalSum (applyValuation subst v) ts =
+    substConstSum subst ts + evalSum v (substRemainingTerms subst ts) := by
+  induction ts with
+  | nil => simp [evalSum, substConstSum, substRemainingTerms]
+  | cons hd tl ih =>
+    obtain ⟨a, l⟩ := hd
+    simp only [evalSum, substConstSum, substRemainingTerms]
+    rw [ih]
+    have h := applySubstTerm_eval subst v a l
+    cases hopt : (applySubstTerm subst a l).2 with
+    | none => simp [hopt] at h; simp [hopt]; omega
+    | some t =>
+      obtain ⟨a', l'⟩ := t
+      simp only [hopt] at h
+      simp only [evalSum]
+      -- After rw [h], goal is:
+      -- d + (a' * g) + (b + c) = d + b + ((a' * g) + c)
+      -- which is just associativity/commutativity of Nat.add
+      rw [h]
+      simp only [Nat.add_assoc]
+      congr 1
+      rw [Nat.add_left_comm]
+
+/-- Main substitution soundness: if the original constraint is satisfied
+    by the substituted valuation, the substituted constraint is satisfied
+    by the original valuation. -/
+theorem applySubstConstr_sound (subst : List (Nat × SubstVal))
+    (c : Constr) (v : Valuation) :
+    c.sat (applyValuation subst v) →
+    (applySubstConstr subst c).sat v := by
+  intro h
+  simp only [Constr.sat] at h ⊢
+  simp only [applySubstConstr]
+  have heq := evalSum_subst subst v c.terms
+  have hmin : min c.degree (substConstSum subst c.terms) ≤
+    substConstSum subst c.terms := Nat.min_le_right _ _
+  omega
+
+/-- If a variable is not in the substitution domain, applyValuation preserves it. -/
+theorem applyValuation_noSubst (subst : List (Nat × SubstVal))
+    (v : Valuation) (i : Nat) (h : lookupSubst subst i = none) :
+    applyValuation subst v i = v i := by
+  simp [applyValuation, h]
+
+/-- If a literal's variable is not in the substitution domain,
+    evalLit is preserved under applyValuation. -/
+theorem evalLit_applyValuation_noSubst (subst : List (Nat × SubstVal))
+    (v : Valuation) (l : Literal) (h : lookupSubst subst l.var = none) :
+    evalLit (applyValuation subst v) l = evalLit v l := by
+  cases l with
+  | pos i =>
+    simp only [Literal.var] at h
+    simp only [evalLit]
+    rw [applyValuation_noSubst subst v i h]
+  | neg i =>
+    simp only [Literal.var] at h
+    simp only [evalLit]
+    rw [applyValuation_noSubst subst v i h]
+
+/-- Check if any term variable is in the substitution domain. -/
+def termsAffected (subst : List (Nat × SubstVal)) : List Term → Bool
+  | [] => false
+  | (_, l) :: rest =>
+    (lookupSubst subst l.var).isSome || termsAffected subst rest
+
+/-- If no term variables are in the substitution domain,
+    evalSum is preserved under applyValuation. -/
+theorem evalSum_applyValuation_noSubst (subst : List (Nat × SubstVal))
+    (v : Valuation) (ts : List Term)
+    (h : termsAffected subst ts = false) :
+    evalSum (applyValuation subst v) ts = evalSum v ts := by
+  induction ts with
+  | nil => simp [evalSum]
+  | cons hd tl ih =>
+    obtain ⟨a, l⟩ := hd
+    simp only [termsAffected, Bool.or_eq_false_iff] at h
+    simp only [evalSum]
+    congr 1
+    · congr 1
+      have hvar : lookupSubst subst l.var = none := by
+        cases hx : lookupSubst subst l.var
+        · rfl
+        · simp [hx] at h
+      exact evalLit_applyValuation_noSubst subst v l hvar
+    · exact ih h.2
+
+/-- If no constraint variables are in the substitution domain,
+    constraint satisfaction is preserved under applyValuation. -/
+theorem constr_sat_applyValuation_noSubst (subst : List (Nat × SubstVal))
+    (c : Constr) (v : Valuation)
+    (h : termsAffected subst c.terms = false)
+    (hsat : c.sat v) :
+    c.sat (applyValuation subst v) := by
+  simp only [Constr.sat] at hsat ⊢
+  rw [evalSum_applyValuation_noSubst subst v c.terms h]
+  exact hsat
+
+/-- Converse of applySubstConstr_sound: if the substituted constraint is
+    satisfied by v, the original is satisfied by the substituted valuation.
+    Needed for the red rule: goal proofs give (G|ω).sat v, need G.sat (ω v). -/
+theorem applySubstConstr_sat_rev (subst : List (Nat × SubstVal))
+    (c : Constr) (v : Valuation) :
+    (applySubstConstr subst c).sat v →
+    c.sat (applyValuation subst v) := by
+  intro h
+  simp only [Constr.sat] at h ⊢
+  simp only [applySubstConstr] at h
+  have heq := evalSum_subst subst v c.terms
+  -- heq: evalSum (applyValuation subst v) c.terms = substConstSum + evalSum v remaining
+  -- h: evalSum v remaining ≥ c.degree - min c.degree (substConstSum)
+  -- goal: evalSum (applyValuation subst v) c.terms ≥ c.degree
+  rw [heq]
+  have hmin : min c.degree (substConstSum subst c.terms) ≤
+    substConstSum subst c.terms := Nat.min_le_right _ _
+  have hmin2 : min c.degree (substConstSum subst c.terms) ≤ c.degree :=
+    Nat.min_le_left _ _
+  omega
+
+end Substitution
+
 end Sat.PB

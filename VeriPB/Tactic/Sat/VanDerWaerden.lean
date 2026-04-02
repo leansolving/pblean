@@ -356,4 +356,235 @@ vdw_reflect vdw9_impossible 9
 theorem vdw_number_2_3 : vanDerWaerdenNumber 8 :=
   ⟨vdw8_exists, vdw9_impossible⟩
 
+-- ============================================================
+-- Generalized W(2,k): arbitrary AP length
+-- ============================================================
+
+/-- k-term APs [a, a+d, ..., a+(k-1)*d] in {1,...,n}. -/
+def apKTuples (k n : Nat) : List (List Nat) :=
+  (List.range n).flatMap fun d0 =>
+    (List.range n).filterMap fun a0 =>
+      let d := d0 + 1
+      let a := a0 + 1
+      let ap := (List.range k).map fun i => a + i * d
+      if ap.all (· ≤ n) then some ap else none
+
+/-- Two constraints per k-AP: not-all-true and not-all-false. -/
+def mkKAPConstrs (vars : List Nat) : List Constr :=
+  [⟨vars.map fun v => (1, Literal.neg v), 1⟩,
+   ⟨vars.map fun v => (1, Literal.pos v), 1⟩]
+
+/-- Build all constraints from a list of k-APs. -/
+def mkKAllConstrs : List (List Nat) → List Constr
+  | [] => []
+  | ap :: rest => mkKAPConstrs ap ++ mkKAllConstrs rest
+
+/-- Encode: satisfiable iff {1,...,n} has a 2-coloring with no
+    monochromatic k-AP. -/
+def encodeK (k n : Nat) : Array Constr :=
+  (mkKAllConstrs (apKTuples k n)).toArray
+
+-- Mathematical predicate for k-APs
+
+/-- A 2-coloring f of {1,...,n} is k-AP-free if no monochromatic
+    k-term AP exists. -/
+def isKAPFree (k n : Nat) (f : Nat → Bool) : Prop :=
+  ∀ a d : Nat, 1 ≤ a → 1 ≤ d →
+    (∀ i, i < k → a + i * d ≤ n) →
+    ¬(∀ i, i < k → f (a + i * d) = f a)
+
+/-- There exists a k-AP-free 2-coloring of {1,...,n}. -/
+def hasKAPFreeColoring (k n : Nat) : Prop :=
+  ∃ f : Nat → Bool, isKAPFree k n f
+
+-- Soundness: evalSum of mapped list
+
+private theorem evalSum_neg_map_ge_one (f : Valuation)
+    (vars : List Nat) (v : Nat) (hv : v ∈ vars) (hf : f v = false) :
+    1 ≤ evalSum f (vars.map fun v => (1, Literal.neg v)) := by
+  induction vars with
+  | nil => exact absurd hv (List.not_mem_nil)
+  | cons hd tl ih =>
+    simp only [List.map_cons, evalSum]
+    rcases List.mem_cons.mp hv with rfl | htl
+    · simp [evalLit, hf]
+    · have := ih htl; omega
+
+private theorem evalSum_pos_map_ge_one (f : Valuation)
+    (vars : List Nat) (v : Nat) (hv : v ∈ vars) (hf : f v = true) :
+    1 ≤ evalSum f (vars.map fun v => (1, Literal.pos v)) := by
+  induction vars with
+  | nil => exact absurd hv (List.not_mem_nil)
+  | cons hd tl ih =>
+    simp only [List.map_cons, evalSum]
+    rcases List.mem_cons.mp hv with rfl | htl
+    · simp [evalLit, hf]
+    · have := ih htl; omega
+
+-- Bridge: List.all bounds to ∀ bounds
+private theorem all_bounds_to_forall (k n a d : Nat)
+    (h : ((List.range k).map fun i => a + i * d).all (· ≤ n) = true) :
+    ∀ i, i < k → a + i * d ≤ n := by
+  intro i hi
+  have hmem : a + i * d ∈ (List.range k).map (fun i => a + i * d) :=
+    List.mem_map.mpr ⟨i, List.mem_range.mpr hi, rfl⟩
+  have := List.all_eq_true.mp h _ hmem
+  exact of_decide_eq_true this
+
+theorem mkKAPConstrs_sat (k n : Nat) (f : Valuation)
+    (a d : Nat) (ha : 1 ≤ a) (hd : 1 ≤ d) (hk : 1 ≤ k)
+    (hbounds : ∀ i, i < k → a + i * d ≤ n)
+    (hfree : isKAPFree k n f) :
+    let ap := (List.range k).map fun i => a + i * d
+    ∀ c ∈ mkKAPConstrs ap, c.sat f := by
+  intro ap c hc
+  have hmono := hfree a d ha hd hbounds
+  have ha_mem : a ∈ ap :=
+    List.mem_map.mpr ⟨0, List.mem_range.mpr hk, by simp⟩
+  have hdiff : ∃ i, i < k ∧ f (a + i * d) ≠ f a :=
+    Classical.byContradiction fun hall =>
+      hmono fun i hi =>
+        Classical.byContradiction fun hne =>
+          hall ⟨i, hi, hne⟩
+  obtain ⟨j, hj, hjne⟩ := hdiff
+  have hj_mem : a + j * d ∈ ap :=
+    List.mem_map.mpr ⟨j, List.mem_range.mpr hj, rfl⟩
+  simp only [mkKAPConstrs, List.mem_cons, List.mem_nil_iff, or_false] at hc
+  rcases hc with rfl | rfl
+  · simp only [Constr.sat]
+    cases hfa : f a with
+    | false => exact evalSum_neg_map_ge_one f ap a ha_mem hfa
+    | true =>
+      have : f (a + j * d) = false := by
+        cases h : f (a + j * d)
+        · rfl
+        · exact absurd (by rw [h, hfa]) hjne
+      exact evalSum_neg_map_ge_one f ap _ hj_mem this
+  · simp only [Constr.sat]
+    cases hfa : f a with
+    | true => exact evalSum_pos_map_ge_one f ap a ha_mem hfa
+    | false =>
+      have : f (a + j * d) = true := by
+        cases h : f (a + j * d)
+        · exact absurd (by rw [h, hfa]) hjne
+        · rfl
+      exact evalSum_pos_map_ge_one f ap _ hj_mem this
+
+theorem mkKAllConstrs_mem (aps : List (List Nat))
+    (c : Constr) (hc : c ∈ mkKAllConstrs aps) :
+    ∃ ap ∈ aps, c ∈ mkKAPConstrs ap := by
+  induction aps with
+  | nil => simp [mkKAllConstrs] at hc
+  | cons ap rest ih =>
+    simp only [mkKAllConstrs, List.mem_append] at hc
+    rcases hc with hc | hc
+    · exact ⟨ap, List.Mem.head _, hc⟩
+    · obtain ⟨ap', hap', hc'⟩ := ih hc
+      exact ⟨ap', List.mem_cons_of_mem _ hap', hc'⟩
+
+theorem apKTuples_valid (k n : Nat) (ap : List Nat)
+    (hap : ap ∈ apKTuples k n) :
+    ∃ a d, 1 ≤ a ∧ 1 ≤ d
+      ∧ ap = (List.range k).map (fun i => a + i * d)
+      ∧ (∀ i, i < k → a + i * d ≤ n) := by
+  simp only [apKTuples, List.mem_flatMap, List.mem_range,
+    List.mem_filterMap] at hap
+  obtain ⟨d0, _, a0, _, hcond⟩ := hap
+  split at hcond
+  · next hbounds =>
+    simp only [Option.some.injEq] at hcond
+    refine ⟨a0 + 1, d0 + 1, by omega, by omega, hcond.symm, ?_⟩
+    exact all_bounds_to_forall k n (a0 + 1) (d0 + 1) hbounds
+  · simp at hcond
+
+/-- Main soundness for k-APs: if encoding is UNSAT, no k-AP-free
+    2-coloring exists. -/
+theorem no_k_ap_free_of_unsat (k n : Nat) (hk : 1 ≤ k)
+    (hunsat : ∀ v : Valuation, ∃ c ∈ (encodeK k n).toList, ¬c.sat v) :
+    ¬hasKAPFreeColoring k n := by
+  intro ⟨f, hfree⟩
+  obtain ⟨c, hc, hnsat⟩ := hunsat f
+  apply hnsat
+  have henc : (encodeK k n).toList = mkKAllConstrs (apKTuples k n) := by
+    simp [encodeK]
+  rw [henc] at hc
+  obtain ⟨ap, hap, hcap⟩ := mkKAllConstrs_mem _ c hc
+  obtain ⟨a, d, ha, hd, hapdef, hbounds⟩ := apKTuples_valid k n ap hap
+  rw [hapdef] at hcap
+  exact mkKAPConstrs_sat k n f a d ha hd hk hbounds hfree c hcap
+
+-- OPB generation for k-APs
+
+def toOPBK (k n : Nat) : String := Id.run do
+  let aps := apKTuples k n
+  let numConstrs := aps.length * 2
+  let mut s := s!"* #variable= {n + 1} #constraint= {numConstrs}"
+  s := s ++ " #equal= 0 intsize= 6\n"
+  for ap in aps do
+    for v in ap do
+      s := s ++ s!"+1 ~x{v + 1} "
+    s := s ++ ">= 1 ;\n"
+    for v in ap do
+      s := s ++ s!"+1 x{v + 1} "
+    s := s ++ ">= 1 ;\n"
+  return s
+
+-- Reflection command for generalized k-APs
+elab "vdwk_reflect " nm:ident ppSpace kTerm:num ppSpace nTerm:num
+    ppSpace proofFile:str : command => do
+  let name := (← getCurrNamespace) ++ nm.getId
+  let k := kTerm.getNat
+  let n := nTerm.getNat
+  let proofPath := proofFile.getString
+  liftTermElabM do
+    let kExpr := mkRawNatLit k
+    let nExpr := mkRawNatLit n
+    let numVarsExpr := mkRawNatLit (n + 1)
+    let proofStr ← IO.FS.readFile (System.FilePath.mk proofPath)
+    let constrsExpr := mkApp2 (mkConst ``encodeK) kExpr nExpr
+    let proofStrExpr := mkStrLit proofStr
+    let checkExpr := mkApp3
+      (mkConst ``VeriPB.Reflect.checkProofBool)
+      constrsExpr numVarsExpr proofStrExpr
+    let auxName := name ++ `_check
+    addAndCompile <| .defnDecl {
+      name := auxName
+      levelParams := []
+      type := mkConst ``Bool
+      value := checkExpr
+      hints := .abbrev
+      safety := .safe
+    }
+    let auxConst := mkConst auxName
+    let reduceBoolApp := mkApp (mkConst ``Lean.reduceBool) auxConst
+    let rflPrf := mkApp2 (mkConst ``Eq.refl [.succ .zero])
+      (mkConst ``Bool) reduceBoolApp
+    let hEqTrue := mkApp3 (mkConst ``Lean.ofReduceBool)
+      auxConst (mkConst ``Bool.true) rflPrf
+    let unsatProof := mkApp4
+      (mkConst ``VeriPB.Reflect.checkProof_sound)
+      constrsExpr numVarsExpr proofStrExpr hEqTrue
+    -- Build hk : 1 ≤ k
+    if k == 0 then throwError "k must be positive"
+    let hkType := mkApp4 (mkConst ``LE.le [.zero])
+      (mkConst ``Nat) (mkConst ``instLENat) (mkRawNatLit 1) kExpr
+    let hkProof ← mkDecideProof hkType
+    let finalProof := mkApp4
+      (mkConst ``no_k_ap_free_of_unsat)
+      kExpr nExpr hkProof unsatProof
+    let finalType := mkApp (mkConst ``Not)
+      (mkApp2 (mkConst ``hasKAPFreeColoring) kExpr nExpr)
+    addDecl <| Declaration.thmDecl {
+      name
+      levelParams := []
+      type := finalType
+      value := finalProof
+    }
+    Lean.logInfo m!"Registered {name} : ¬ hasKAPFreeColoring {k} {n}"
+
+-- W(2,4) upper bound: verified via VeriPB reflection checker
+-- 35 variables, 374 constraints
+vdwk_reflect vdw35_impossible 4 35
+  "applications/vdw/vdw35_kernel.pbp"
+
 end VanDerWaerden
