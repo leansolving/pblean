@@ -49,28 +49,32 @@ theorem paley_alpha_not_monotone :
       independenceNumber (paley p) a ∧ independenceNumber (paley q) b ∧ a > b
 ```
 
-**Langford pairing** (`Langford.lean`) — No Langford pairing of order 6 exists.
+**Langford pairing** (`Langford.lean`) — No Langford pairing of orders 6 and 9 exists.
 ```lean
 -- Langford namespace
 theorem langford6_impossible : ¬hasLangfordPairing 6
+theorem langford9_impossible : ¬hasLangfordPairing 9
 ```
 
-**Schur number** (`Schur.lean`) — S(2) = 4: {1,...,4} has a Schur-free 2-coloring but {1,...,5} does not.
+**Schur number** (`Schur.lean`) — S(2) = 4: {1,...,4} has a Schur-free 2-coloring but {1,...,5} does not. Generalized to k-coloring: S(3) = 13 verified via one-hot encoding.
 ```lean
 -- Schur namespace
 theorem schur_number_2 : schurNumber 4
+theorem schur14_impossible : ¬hasKSchurFreeColoring 3 14
 ```
 
-**Van der Waerden number** (`VanDerWaerden.lean`) — W(2,3) = 9: {1,...,8} has an AP-free 2-coloring but {1,...,9} does not.
+**Van der Waerden number** (`VanDerWaerden.lean`) — W(2,3) = 9: {1,...,8} has an AP-free 2-coloring but {1,...,9} does not. Generalized to k-term APs: W(2,4) = 35 verified.
 ```lean
 -- VanDerWaerden namespace
 theorem vdw_number_2_3 : vanDerWaerdenNumber 8
+theorem vdw35_impossible : ¬hasKAPFreeColoring 4 35
 ```
 
-**Ramsey number** (`Ramsey.lean`) — R(3,3) = 6: K₅ has a triangle-free 2-coloring but K₆ does not.
+**Ramsey number** (`Ramsey.lean`) — R(3,3) = 6: K₅ has a triangle-free 2-coloring but K₆ does not. Generalized to asymmetric R(s,t): R(3,4) ≤ 9 verified.
 ```lean
 -- Ramsey namespace
 theorem ramsey_3_3 : ramseyNumber 5
+theorem ramsey9_34_impossible : ¬hasAsymRamseyFreeColoring 9 3 4
 ```
 
 **Equitable coloring** (`EquitableColoring.lean`) — The equitable chromatic number of K_{3,3,1} is 5.
