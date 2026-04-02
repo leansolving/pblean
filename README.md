@@ -17,7 +17,7 @@ Three-layer design mirroring LRAT:
 | Metaprogram | `VeriPB/Tactic/Sat/FromVeriPB.lean` | Parser, checker, `Expr`-level proof construction |
 | Reflection | `VeriPB/Tactic/Sat/Reflect.lean` | `checkProofBool` + `ofReduceBool` native evaluation |
 
-Two verification paths are available. The **metaprogram path** (`veripb_proof`) builds kernel proof terms directly in `MetaM`. The **reflection path** (`veripb_reflect`) uses `native_decide` for better scalability at the cost of trusting the Lean compiler — the same trade-off as `bv_decide`. All application theorems use the reflection path.
+Verification uses reflection: a Boolean checker with a proved soundness theorem, executed as compiled native code via `native_decide` (same trade-off as `bv_decide`).
 
 ## Supported VeriPB rules
 
@@ -25,7 +25,7 @@ Two verification paths are available. The **metaprogram path** (`veripb_proof`) 
 
 ## Application modules
 
-Each module provides a trusted PB encoding, soundness theorems, and verified results for a combinatorial problem. The `applications/` directory contains the corresponding OPB encodings and VeriPB kernel proofs, loaded at elaboration time. Naming convention: `Paley_97.opb` (encoding) and `Paley_97_kernel.pbp` (kernel proof).
+Each module provides a trusted PB encoding and soundness theorems for a combinatorial problem. The `applications/` directory contains the corresponding OPB encodings and VeriPB kernel proofs, loaded at elaboration time. Naming convention: `Paley_97.opb` (encoding) and `Paley_97_kernel.pbp` (kernel proof).
 
 **Independent set** (`IndependentSet.lean`) — Independence number of Paley graphs for all primes p ≡ 1 (mod 4) from 13 to 101. (Paley(5) is omitted as α(K₅) = 1 is trivial.)
 ```lean
@@ -98,7 +98,7 @@ theorem bp12_5_impossible : ¬hasPacking inst12_5
 
 ## Trust base
 
-Standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`) plus the Lean compiler (`Lean.trustCompiler`), the same trust model as `bv_decide` and `omega`.
+Standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`) plus `Lean.trustCompiler` for compiled native evaluation.
 
 ## Building
 

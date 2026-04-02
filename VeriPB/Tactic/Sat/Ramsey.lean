@@ -494,8 +494,7 @@ private theorem cliqueEdgeVars_complete (n : Nat) (vs : List Nat)
   exact ⟨i, hi, j, hj, by simp [hij]⟩
 
 private theorem not_all_has_false (l : List Nat) (f : Nat → Bool)
-    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = true))
-    (hl : l.length ≥ 2) :
+    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = true)) :
     ∃ v ∈ cliqueEdgeVars n l, f v = false := by
   have hdiff : ∃ i j, i ∈ l ∧ j ∈ l ∧ i < j ∧ f (edgeVar n i j) ≠ true :=
     Classical.byContradiction fun hall =>
@@ -510,8 +509,7 @@ private theorem not_all_has_false (l : List Nat) (f : Nat → Bool)
   exact ⟨edgeVar n i j, cliqueEdgeVars_complete n l i j hi hj hij, hf⟩
 
 private theorem not_all_has_true (l : List Nat) (f : Nat → Bool)
-    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = false))
-    (hl : l.length ≥ 2) :
+    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = false)) :
     ∃ v ∈ cliqueEdgeVars n l, f v = true := by
   have hdiff : ∃ i j, i ∈ l ∧ j ∈ l ∧ i < j ∧ f (edgeVar n i j) ≠ false :=
     Classical.byContradiction fun hall =>
