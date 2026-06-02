@@ -1,6 +1,6 @@
 # PBLean: VeriPB Proof Certificates for Lean 4
 
-[![Lean 4](https://img.shields.io/badge/Lean-4.28.0--rc1-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHRleHQgeD0iNCIgeT0iMjYiIGZvbnQtc2l6ZT0iMjgiIGZpbGw9IndoaXRlIj5MPC90ZXh0Pjwvc3ZnPg==)](https://lean-lang.org/)
+[![Lean 4](https://img.shields.io/badge/Lean-4.30.0-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHRleHQgeD0iNCIgeT0iMjYiIGZvbnQtc2l6ZT0iMjgiIGZpbGw9IndoaXRlIj5MPC90ZXh0Pjwvc3ZnPg==)](https://lean-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 **PBLean** provides verified pseudo-Boolean proof checking in Lean 4. Reads [VeriPB](https://gitlab.com/MIAOresearch/software/VeriPB) kernel-format proofs and produces Lean theorems, analogous to `Std.Tactic.BVDecide` (LRAT) but for pseudo-Boolean reasoning. VeriPB's kernel format is the fully-elaborated proof format produced by `veripb --elaborate`, in which every inference step is made explicit. Standalone Lean 4 project with no Mathlib dependency.

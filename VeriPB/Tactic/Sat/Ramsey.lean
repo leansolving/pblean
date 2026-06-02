@@ -494,8 +494,7 @@ private theorem cliqueEdgeVars_complete (n : Nat) (vs : List Nat)
   exact ⟨i, hi, j, hj, by simp [hij]⟩
 
 private theorem not_all_has_false (l : List Nat) (f : Nat → Bool)
-    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = true))
-    (hl : l.length ≥ 2) :
+    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = true)) :
     ∃ v ∈ cliqueEdgeVars n l, f v = false := by
   have hdiff : ∃ i j, i ∈ l ∧ j ∈ l ∧ i < j ∧ f (edgeVar n i j) ≠ true :=
     Classical.byContradiction fun hall =>
@@ -510,8 +509,7 @@ private theorem not_all_has_false (l : List Nat) (f : Nat → Bool)
   exact ⟨edgeVar n i j, cliqueEdgeVars_complete n l i j hi hj hij, hf⟩
 
 private theorem not_all_has_true (l : List Nat) (f : Nat → Bool)
-    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = false))
-    (hl : l.length ≥ 2) :
+    (h : ¬(∀ i j, i ∈ l → j ∈ l → i < j → f (edgeVar n i j) = false)) :
     ∃ v ∈ cliqueEdgeVars n l, f v = true := by
   have hdiff : ∃ i j, i ∈ l ∧ j ∈ l ∧ i < j ∧ f (edgeVar n i j) ≠ false :=
     Classical.byContradiction fun hall =>
@@ -573,25 +571,25 @@ private theorem subsets_valid (n s : Nat) (vs : List Nat)
         exact ⟨hlen, fun v hv => Nat.lt_succ_of_lt (hbound v hv), hnodup⟩
 
 private theorem red_constr_sat (n s : Nat) (f : Valuation)
-    (vs : List Nat) (hvs : vs ∈ subsets n s) (hs : s ≥ 2)
+    (vs : List Nat) (hvs : vs ∈ subsets n s) (_hs : s ≥ 2)
     (hfree : noRedClique n s f) :
     (⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.neg v), 1⟩ :
       Constr).sat f := by
   simp only [Constr.sat]
   obtain ⟨hlen, hbound, hsorted⟩ := subsets_valid n s vs hvs
   have hno := hfree vs hlen hbound hsorted
-  obtain ⟨v, hv, hvf⟩ := not_all_has_false vs f hno (by omega)
+  obtain ⟨v, hv, hvf⟩ := not_all_has_false vs f hno
   exact evalSum_neg_map_ge_one' f _ v hv hvf
 
 private theorem blue_constr_sat (n t : Nat) (f : Valuation)
-    (vs : List Nat) (hvs : vs ∈ subsets n t) (ht : t ≥ 2)
+    (vs : List Nat) (hvs : vs ∈ subsets n t) (_ht : t ≥ 2)
     (hfree : noBlueClique n t f) :
     (⟨(cliqueEdgeVars n vs).map fun v => (1, Literal.pos v), 1⟩ :
       Constr).sat f := by
   simp only [Constr.sat]
   obtain ⟨hlen, hbound, hsorted⟩ := subsets_valid n t vs hvs
   have hno := hfree vs hlen hbound hsorted
-  obtain ⟨v, hv, hvf⟩ := not_all_has_true vs f hno (by omega)
+  obtain ⟨v, hv, hvf⟩ := not_all_has_true vs f hno
   exact evalSum_pos_map_ge_one' f _ v hv hvf
 
 private theorem encodeAsym_mem (n s t : Nat) (c : Constr)
