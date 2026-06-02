@@ -766,7 +766,7 @@ theorem evalSum_subst (subst : List (Nat × SubstVal))
     rw [ih]
     have h := applySubstTerm_eval subst v a l
     cases hopt : (applySubstTerm subst a l).2 with
-    | none => simp at h; simp; omega
+    | none => simp only [hopt] at h ⊢; omega
     | some t =>
       obtain ⟨a', l'⟩ := t
       simp only [hopt] at h

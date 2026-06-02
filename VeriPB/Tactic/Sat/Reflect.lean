@@ -1988,7 +1988,7 @@ private theorem processRedGoalsBool_goalSat
           | some c => some (Sat.PB.applySubstConstr subst c)
           | none => none
         | none => none) with
-    | none => simp [hgc_exec] at hres
+    | none => simp only [hgc_exec] at hres; exact absurd hres (by simp)
     | some goalConstr =>
       simp only [hgc_exec] at hres
       -- Degree check passes (otherwise hres is absurd)
