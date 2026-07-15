@@ -8,7 +8,7 @@ import VeriPB.Tactic.Sat.Reflect
 /-!
 # Reflection-based Checker Tests
 
-Test the reflection-based checker (`checkProofBool` + `ofReduceBool`)
+Test the reflection-based checker (`checkProofBool` + native evaluation)
 on a small OPB instance with VeriPB kernel proof.
 -/
 

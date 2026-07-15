@@ -15,7 +15,7 @@ Three-layer design mirroring LRAT:
 |-------|------|-------------|
 | Kernel | `VeriPB/Tactic/Sat/PseudoBoolean.lean` | PB constraint types, evaluation, soundness lemmas |
 | Metaprogram | `VeriPB/Tactic/Sat/FromVeriPB.lean` | Parser, checker, `Expr`-level proof construction |
-| Reflection | `VeriPB/Tactic/Sat/Reflect.lean` | `checkProofBool` + `ofReduceBool` native evaluation |
+| Reflection | `VeriPB/Tactic/Sat/Reflect.lean` | `checkProofBool` + native evaluation via per-use axioms |
 
 Verification uses reflection: a Boolean checker with a proved soundness theorem, executed as compiled native code via `native_decide` (same trade-off as `bv_decide`).
 
@@ -98,18 +98,18 @@ theorem bp12_5_impossible : ¬hasPacking inst12_5
 
 ## Trust base
 
-Standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`) plus `Lean.trustCompiler` for compiled native evaluation.
+Standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`) plus, per theorem, one native-evaluation axiom (`_native.<command>.ax_<n>`, the same mechanism `native_decide` uses) asserting that the compiled checker run returned `true`.
 
 ## Building
 
 Requires [elan](https://github.com/leanprover/elan). The `lean-toolchain` file pins the exact Lean version.
 
 ```
-lake build                 # build everything (~7 min, mostly IndependentSet.lean)
+lake build                 # build everything (~40 sec)
 lake build VeriPBKernel    # build kernel + tests only (~20 sec)
 ```
 
-Full build time is dominated by `IndependentSet.lean` (~6 min), which verifies 11 Paley graph independence numbers via `native_decide`. The kernel-only build is fast.
+The checker modules are precompiled to native code (`precompileModules`, like `bv_decide`), so all certificate checks — including the 11 Paley graph independence numbers in `IndependentSet.lean` — run compiled rather than interpreted.
 
 ## Benchmarks
 
