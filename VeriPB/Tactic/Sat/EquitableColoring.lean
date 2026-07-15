@@ -758,24 +758,10 @@ elab "eq_coloring_reflect " nm:ident ppSpace
     let checkExpr := mkApp3
       (mkConst ``VeriPB.Reflect.checkProofBool)
       constrsExpr numVarsExpr proofStrExpr
-    let auxName := name ++ `_check
-    addAndCompile <| .defnDecl {
-      name := auxName
-      levelParams := []
-      type := mkConst ``Bool
-      value := checkExpr
-      hints := .abbrev
-      safety := .safe
-    }
-    let auxConst := mkConst auxName
-    let reduceBoolApp :=
-      mkApp (mkConst ``Lean.reduceBool) auxConst
-    let rflPrf := mkApp2
-      (mkConst ``Eq.refl [.succ .zero])
-      (mkConst ``Bool) reduceBoolApp
-    let hEqTrue := mkApp3
-      (mkConst ``Lean.ofReduceBool)
-      auxConst (mkConst ``Bool.true) rflPrf
+    let hEqTrue ← match ← Lean.Meta.nativeEqTrue `eq_coloring_reflect checkExpr
+        (axiomDeclRange? := (← getRef)) with
+      | .success prf => pure prf
+      | .notTrue => throwError "Reflection checker returned false for {name}"
     let unsatProof := mkApp4
       (mkConst ``VeriPB.Reflect.checkProof_sound)
       constrsExpr numVarsExpr proofStrExpr hEqTrue

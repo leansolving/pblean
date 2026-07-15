@@ -1,5 +1,5 @@
 name = "veripb"
-version = "0.3.0"
+version = "0.3.1"
 defaultTargets = ["VeriPB"]
 
 [[lean_lib]]
@@ -7,3 +7,19 @@ name = "VeriPBKernel"
 
 [[lean_lib]]
 name = "VeriPB"
+
+# Precompiled checker: exposes the closed module set of the reflection
+# checker as native code so checkProofBool runs compiled (like bv_decide)
+# instead of interpreted. Declared LAST: Lake resolves module ownership
+# with findSomeRev? (last lib wins), and this lib must own these three
+# modules; otherwise the VeriPB lib claims them via its root-name prefix
+# and precompilation causes build cycles through VeriPB:shared.
+[[lean_lib]]
+name = "VeriPBReflect"
+roots = ["VeriPB.Tactic.Sat.Reflect"]
+globs = [
+  "VeriPB.Tactic.Sat.PseudoBoolean",
+  "VeriPB.Tactic.Sat.FromVeriPB",
+  "VeriPB.Tactic.Sat.Reflect",
+]
+precompileModules = true

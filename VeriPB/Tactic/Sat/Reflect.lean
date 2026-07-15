@@ -2419,29 +2419,18 @@ elab "veripb_reflect " n:ident
       | .ok r => pure r
       | .error e => throwError "OPB parse error: {e}"
     -- Interpreted pre-check removed for performance; native evaluation
-    -- via ofReduceBool provides the verified check
+    -- via nativeEqTrue provides the verified check
     let constrsExpr ← mkConstrArrayExpr constrs
     let numVarsExpr := mkRawNatLit numVars
     let proofStrExpr := mkStrLit proofStr
     let unsatType := mkApp (mkConst ``formulaUnsat) constrsExpr
     let checkBoolExpr := mkApp3 (mkConst ``checkProofBool)
       constrsExpr numVarsExpr proofStrExpr
-    -- Native evaluation via ofReduceBool (like native_decide)
-    let auxName := name ++ `_check
-    addAndCompile <| .defnDecl {
-      name := auxName
-      levelParams := []
-      type := mkConst ``Bool
-      value := checkBoolExpr
-      hints := .abbrev
-      safety := .safe
-    }
-    let auxConst := mkConst auxName
-    let reduceBoolApp := mkApp (mkConst ``Lean.reduceBool) auxConst
-    let rflPrf := mkApp2 (mkConst ``Eq.refl [.succ .zero])
-      (mkConst ``Bool) reduceBoolApp
-    let hEqTrue := mkApp3 (mkConst ``Lean.ofReduceBool)
-      auxConst (mkConst ``Bool.true) rflPrf
+    -- Native evaluation via a per-use axiom (like native_decide)
+    let hEqTrue ← match ← Lean.Meta.nativeEqTrue `veripb_reflect checkBoolExpr
+        (axiomDeclRange? := (← getRef)) with
+      | .success prf => pure prf
+      | .notTrue => throwError "Reflection checker returned false for {name}"
     let proof := mkApp4 (mkConst ``checkProof_sound)
       constrsExpr numVarsExpr proofStrExpr hEqTrue
     addAndCompile <| Declaration.thmDecl {
