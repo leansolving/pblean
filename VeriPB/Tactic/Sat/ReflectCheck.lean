@@ -109,9 +109,8 @@ def execPolOne (db : Std.HashMap Nat Constr) (stack : List VeriPB.StackElem)
       if varName.startsWith "x" then
         match (varName.drop 1).toString.toNat? with
         | some n => if n > 0 then
-            match VeriPB.weakenConstr c (n - 1) with
-            | .ok result => some (.constr result :: rest)
-            | .error _ => none
+            -- VeriPB weakens the normalized constraint
+            some (.constr (VeriPB.weakenConstr (VeriPB.normalizeConstr c) (n - 1)) :: rest)
           else none
         | none => none
       else none

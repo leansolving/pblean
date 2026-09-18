@@ -19,6 +19,13 @@ veripb_reflect php21_reflect
   "VeriPB/Tactic/Sat/Tests/data/php21.opb"
   "VeriPB/Tactic/Sat/Tests/data/php21_kernel.pbp"
 
+-- Weakening semantics (VeriPB-checked proof): variable on both sides of the
+-- operand, absent variable (no-op), coefficient above the degree (trivial),
+-- removal from a two-block sum.
+veripb_reflect weaken_cases_reflect
+  "VeriPB/Tactic/Sat/Tests/data/weaken_cases.opb"
+  "VeriPB/Tactic/Sat/Tests/data/weaken_cases_kernel.pbp"
+
 -- Red subproof test: pigeon-hole variant with redundance-based strengthening.
 -- Uses red/dom with explicit subproof (proofgoal #1 and proofgoal 1).
 -- Tests: red rule, substitution parsing, goal verification, auto-satisfaction.

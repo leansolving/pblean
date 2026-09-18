@@ -993,21 +993,14 @@ def divConstr (c : Sat.PB.Constr) (k : Nat) : Sat.PB.Constr :=
 def saturateConstr (c : Sat.PB.Constr) : Sat.PB.Constr :=
   ⟨c.terms.map fun (a, l) => (min a c.degree, l), c.degree⟩
 
-/-- Weaken a constraint by removing a variable.
-    Finds the term with the given variable, subtracts its coefficient from the degree.
-    Errors if variable not found or coefficient exceeds degree. -/
-def weakenConstr (c : Sat.PB.Constr) (varIdx : Nat) : Except String Sat.PB.Constr :=
-  let rec findAndRemove (pre : List Sat.PB.Term) : List Sat.PB.Term → Except String Sat.PB.Constr
-    | [] => .error s!"weaken: variable index {varIdx} not found in constraint"
-    | (a, l) :: rest =>
-      if l.var == varIdx then
-        if a ≤ c.degree then
-          .ok ⟨pre.reverse ++ rest, c.degree - a⟩
-        else
-          .error s!"weaken: coefficient {a} exceeds degree {c.degree}"
-      else
-        findAndRemove ((a, l) :: pre) rest
-  findAndRemove [] c.terms
+/-- Weaken a constraint by a variable (VeriPB `x w`): remove every term of
+the variable and subtract the removed coefficients from the degree
+(truncated at 0, so a coefficient above the degree gives the trivial
+constraint). A variable that does not occur is a no-op. Callers apply this
+to the normalized operand, as VeriPB does. -/
+def weakenConstr (c : Sat.PB.Constr) (varIdx : Nat) : Sat.PB.Constr :=
+  ⟨c.terms.filter fun t => !(t.2.var == varIdx),
+   c.degree - Sat.PB.coeffSumR (c.terms.filter fun t => t.2.var == varIdx)⟩
 
 -- RUP via multiply-add-normalize
 
@@ -1255,8 +1248,8 @@ def execPolRPN (ops : List PolOp) (db : Std.HashMap Nat Sat.PB.Constr) :
           | none => .error s!"invalid variable in weaken: {varName}"
         else
           .error s!"expected variable name starting with 'x', got: {varName}"
-        let weakened ← weakenConstr c varIdx
-        .ok (.constr weakened :: rest)
+        -- VeriPB weakens the normalized constraint
+        .ok (.constr (weakenConstr (normalizeConstr c) varIdx) :: rest)
       | _ => .error "pol w: need constraint on stack"
   let finalStack ← ops.foldlM (init := ([] : List StackElem)) execOne
   match finalStack with
@@ -1708,6 +1701,31 @@ def buildNormalization (rawConstr : Sat.PB.Constr) (rawExpr : Expr)
 
 -- Direct normalization (for RUP: produces c.sat v proofs, not wrapped)
 
+/-- Expr-level weakening by a variable: remove the terms of `varIdx` one at
+a time, each step justified by `Sat.PB.weaken_term_sat`. Returns the final
+constraint and its proof `fun v hv => ...`. `fuel` bounds the number of
+removals (the number of terms suffices). -/
+def buildWeakenVar (varIdx : Nat) (ctx : Expr) : Nat → Sat.PB.Constr → Expr →
+    Sat.PB.Constr × Expr
+  | 0, cur, curProof => (cur, curProof)
+  | fuel + 1, cur, curProof =>
+    match cur.terms.findIdx? fun (_, l) => l.var == varIdx with
+    | none => (cur, curProof)
+    | some idx =>
+      let pre := cur.terms.take idx
+      let (a, l) := cur.terms[idx]!
+      let post := cur.terms.drop (idx + 1)
+      let vTy := mkConst ``Sat.PB.Valuation
+      let allSatTy := mkApp2 (mkConst ``Sat.PB.PBFmla.allSat) (mkBVar 0) ctx
+      -- weaken_term_sat v pre post a l d (curProof v hv)
+      let body := mkApp7 (mkConst ``Sat.PB.weaken_term_sat)
+        (mkBVar 1) (buildTermListExpr pre) (buildTermListExpr post)
+        (mkRawNatLit a) (toExpr l) (mkRawNatLit cur.degree)
+        (mkApp2 curProof (mkBVar 1) (mkBVar 0))
+      let proof := mkLambda `v .default vTy <|
+        mkLambda `hv .default allSatTy body
+      buildWeakenVar varIdx ctx fuel ⟨pre ++ post, cur.degree - a⟩ proof
+
 /-- Remove a zero-coefficient term, producing a direct `c.sat v` proof.
     `vExpr` is the expression for the valuation variable `v`. -/
 def buildRemoveZeroDirect (idx : Nat) (terms : List Sat.PB.Term) (degree : Nat)
@@ -1912,35 +1930,12 @@ def buildPolProof (ops : List PolOp) (db : Std.HashMap Nat StoredConstr)
           | none => .error s!"invalid variable in weaken: {varName}"
         else
           .error s!"expected variable name starting with 'x', got: {varName}"
-        -- Find the term with the matching variable
-        let terms := sc.constr.terms
-        let degree := sc.constr.degree
-        match terms.findIdx? fun (_, l) => l.var == varIdx with
-        | none => .error s!"pol w: variable x{varIdx + 1} not found in constraint"
-        | some idx =>
-          let pre := terms.take idx
-          let (a, l) := terms[idx]!
-          let post := terms.drop (idx + 1)
-          if a > degree then
-            .error s!"pol w: coefficient {a} exceeds degree {degree} for variable x{varIdx + 1}"
-          else
-          let preExpr := buildTermListExpr pre
-          let postExpr := buildTermListExpr post
-          let lExpr := toExpr l
-          let aExpr := mkRawNatLit a
-          let dExpr := mkRawNatLit degree
-          let hleProof := mkNatLeProof a degree
-          let vTy := mkConst ``Sat.PB.Valuation
-          let allSatTy := mkApp2 (mkConst ``Sat.PB.PBFmla.allSat) (mkBVar 0) ctx
-          let body := mkApp (mkApp (mkApp (mkApp (mkApp (mkApp (mkApp
-            (mkConst ``Sat.PB.weaken_term_sat)
-            (mkBVar 1)) preExpr) postExpr) aExpr) lExpr) dExpr) hleProof
-          let body := mkApp body (mkApp2 sc.proof (mkBVar 1) (mkBVar 0))
-          let proof := mkLambda `v .default vTy <|
-            mkLambda `hv .default allSatTy body
-          let newConstr : Sat.PB.Constr := ⟨pre ++ post, degree - a⟩
-          let newExpr := buildConstrExpr newConstr
-          .ok (.constr ⟨newConstr, newExpr, proof⟩ :: rest)
+        -- VeriPB weakens the normalized constraint and removes every term of
+        -- the variable (absent variable: no-op; coefficient above the degree:
+        -- trivial constraint). Same result as `weakenConstr (normalizeConstr c)`.
+        let (normC, _normE, normP) := buildNormalization sc.constr sc.expr sc.proof ctx
+        let (newConstr, proof) := buildWeakenVar varIdx ctx normC.terms.length normC normP
+        .ok (.constr ⟨newConstr, buildConstrExpr newConstr, proof⟩ :: rest)
       | _ => .error "pol w: need constraint on stack"
   let finalStack ← ops.foldlM (init := ([] : List MetaStackElem)) execOne
   match finalStack with

@@ -27,17 +27,12 @@ open Sat.PB VeriPB.Reflect.Fast VeriPB.Tests.Normalize
 the verified normalizer. -/
 def refNormalize (c : Constr) : Constr := normalizeConstrRef c
 
-def refWeaken (c : Constr) (v : Nat) : Option Constr :=
-  match VeriPB.weakenConstr c v with
-  | .ok r => some r
-  | .error _ => none
-
 def refNegate (c : Constr) : Constr := c.negate
 
 /-- A random operation applied to a pair (fast, reference); `pool` supplies
-operands for `add`. Returns `none` for an operation that does not apply
-(weakening a variable with too large a coefficient), in which case both
-sides must agree on that. -/
+operands for `add`. Weakening (like division and saturation) normalizes
+first, as in the checkers; the variable may be absent from the constraint
+or have a coefficient above the degree. -/
 def step (r : Rng) (pool : Array (Constr × FConstr)) (f : FConstr) (c : Constr) :
     Option (FConstr × Constr) × Rng := Id.run do
   let (op, r1) := r.below 7
@@ -59,12 +54,9 @@ def step (r : Rng) (pool : Array (Constr × FConstr)) (f : FConstr) (c : Constr)
     return (some (saturateFConstr (normalizeFConstr f),
       VeriPB.saturateConstr (refNormalize c)), r)
   | 4 =>
-    let (v, r2) := r.below 4; r := r2
-    match weakenFConstr f v, refWeaken c v with
-    | some f', some c' => return (some (f', c'), r)
-    | none, none => return (none, r)
-    | some _, none => return (some (f, ⟨[], 999999⟩), r)  -- force a mismatch report
-    | none, some _ => return (some (⟨#[], #[], 999999, 0⟩, c), r)
+    let (v, r2) := r.below 5; r := r2
+    return (some (weakenFConstr (normalizeFConstr f) v,
+      VeriPB.weakenConstr (refNormalize c) v), r)
   | 5 =>
     return (some (f.negate, refNegate c), r)
   | _ =>

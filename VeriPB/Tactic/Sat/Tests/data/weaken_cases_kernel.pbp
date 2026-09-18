@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+f 5 ;
+pol 1 x1 w x1 w ;
+pol 4 x1 w ;
+pol 5 x1 w ;
+pol 1 x2 w ;
+pol 2 3 + x2 w ;
+pol 2 3 + x3 w ;
+pol 6 2 + 3 + ;
+output NONE ;
+conclusion UNSAT : 12 ;
+end pseudo-Boolean proof ;

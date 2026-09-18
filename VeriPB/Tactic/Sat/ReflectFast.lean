@@ -20,8 +20,8 @@ verified definition accepts. Every operation below mirrors its verified
 counterpart in `ReflectCheck.lean` step by step, including term order:
 normalization happens at the same points, produces the same term order
 (`VeriPB.normalizeArrays` is an exact simulation of `VeriPB.normalizeConstr`),
-weakening removes the first occurrence of a variable, and RUP combination
-picks the first complementary pair in accumulator order.
+weakening normalizes and then removes every term of the variable, and RUP
+combination picks the first complementary pair in accumulator order.
 
 **Representation.** A constraint is stored as two parallel `Array Nat`
 fields: coefficients and literal codes (`2*v` for `x_v`, `2*v+1` for
@@ -151,23 +151,26 @@ def saturateFConstr (c : FConstr) : FConstr :=
   ⟨c.coeffs.map (min · c.degree), c.lits, c.degree,
     if c.degree == 0 then 0 else c.split⟩
 
-/-- Remove the first term of variable `varIdx` (mirrors `VeriPB.weakenConstr`).
-Removing a term from a block leaves a block. -/
-def weakenFConstr (c : FConstr) (varIdx : Nat) : Option FConstr := Id.run do
+/-- Remove every term of variable `varIdx` and subtract the removed
+coefficients from the degree, truncated at 0 (mirrors
+`VeriPB.weakenConstr`; the caller normalizes first, as the verified
+`execPolOne` does). Removing terms from a block leaves a block, so the
+structural flag is adjusted rather than dropped. -/
+def weakenFConstr (c : FConstr) (varIdx : Nat) : FConstr := Id.run do
   let n := c.lits.size
+  let mut cs : Array Nat := Array.mkEmpty n
+  let mut ls : Array Nat := Array.mkEmpty n
+  let mut removed := 0
+  let mut removedBefore := 0  -- removed terms with index < c.split
   for i in [:n] do
     if c.lits[i]! / 2 == varIdx then
-      let a := c.coeffs[i]!
-      if a ≤ c.degree then
-        let split :=
-          if c.split == 0 then 0
-          else if c.split == n then n - 1
-          else if i < c.split then c.split - 1
-          else c.split
-        return some ⟨c.coeffs.eraseIdxIfInBounds i, c.lits.eraseIdxIfInBounds i,
-          c.degree - a, split⟩
-      else return none
-  return none
+      removed := removed + c.coeffs[i]!
+      if i < c.split then removedBefore := removedBefore + 1
+    else
+      cs := cs.push c.coeffs[i]!
+      ls := ls.push c.lits[i]!
+  let split := if c.split == 0 then 0 else c.split - removedBefore
+  return ⟨cs, ls, c.degree - removed, split⟩
 
 /-- General exact normalization through `VeriPB.normalizeArraysCore`; the
 result is flagged as a block when the one-pass path completed. -/
@@ -284,9 +287,7 @@ def execFPolOne (db : Std.HashMap Nat FConstr)
       if varName.startsWith "x" then
         match (varName.drop 1).toString.toNat? with
         | some n => if n > 0 then
-            match weakenFConstr c (n - 1) with
-            | some result => some (.constr result :: rest)
-            | none => none
+            some (.constr (weakenFConstr (normalizeFConstr c) (n - 1)) :: rest)
           else none
         | none => none
       else none

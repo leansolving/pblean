@@ -14,9 +14,8 @@ through `@[implemented_by]`, and the fast reflection checker calls
 `normalizeArrays` directly. The `nativeEqTrue` axioms produced by
 `veripb_reflect` assert facts about the *verified* definition, so the
 runtime replacement must be extensionally equal to it, including the order
-of the resulting terms (term order is observable: weakening removes the
-first term of a variable, and RUP hint combination picks the first
-complementary pair in accumulator order).
+of the resulting terms (term order is observable: RUP hint combination
+picks the first complementary pair in accumulator order).
 
 This test compares `normalizeArrays` and its general fallback
 `normalizeArraysGeneral` against a verbatim copy of `normalizeConstr`

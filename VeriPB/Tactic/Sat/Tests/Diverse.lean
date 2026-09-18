@@ -69,6 +69,26 @@ output NONE ;
 conclusion UNSAT : 7;
 end pseudo-Boolean proof;"
 
+-- Weaken semantics (VeriPB): the operand is normalized first and every
+-- term of the variable is removed. 1 + 2 = x1 + ~x1 + 2x2 >= 2 normalizes
+-- to 2x2 >= 1, so `x1 w` is a no-op (id 4); weakening x2 there subtracts
+-- more than the degree and gives the trivial 0 >= 0 (id 5); 4 + 2*3 is the
+-- contradiction. (Weakening the raw operand would give ~x1 + 2x2 >= 1
+-- instead of id 4, and no contradiction.)
+veripb_proof weaken_normalized
+  "p cnf 2 3
+1 2 0
+-1 2 0
+-2 0"
+  "pseudo-Boolean proof version 3.0
+f 3;
+pol 1 2 + x1 w;
+pol 4 x2 w;
+pol 4 3 2 * +;
+output NONE ;
+conclusion UNSAT : 6;
+end pseudo-Boolean proof;"
+
 end VeriPB.Tests.Diverse
 
 /-!

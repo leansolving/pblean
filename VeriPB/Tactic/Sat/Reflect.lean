@@ -788,37 +788,18 @@ private theorem StackSound_head_constr (original : Array Constr)
       (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v :=
   h (.constr c) (.head _)
 
-private theorem findAndRemove_sat (c : Constr) (varIdx : Nat)
-    (pre : List Term) (remaining : List Term) (result : Constr)
-    (v : Valuation)
-    (hfind : VeriPB.weakenConstr.findAndRemove c varIdx pre remaining =
-      .ok result)
-    (hsat : Sat.PB.evalSum v (pre.reverse ++ remaining) ≥ c.degree) :
-    result.sat v := by
-  induction remaining generalizing pre with
-  | nil => simp [VeriPB.weakenConstr.findAndRemove] at hfind
-  | cons term rest ih =>
-    obtain ⟨a, l⟩ := term
-    simp only [VeriPB.weakenConstr.findAndRemove] at hfind
-    by_cases hvar : l.var == varIdx
-    · simp only [hvar, ite_true] at hfind
-      by_cases hle : a ≤ c.degree
-      · simp only [hle, ite_true] at hfind
-        injection hfind with hfind; rw [← hfind]
-        exact weaken_term_sat v pre.reverse rest a l c.degree hle hsat
-      · simp [hle] at hfind
-    · simp only [hvar] at hfind
-      apply ih ((a, l) :: pre) hfind
-      rw [List.reverse_cons, List.append_assoc]
-      exact hsat
-
-private theorem weakenConstr_sat (c : Constr) (varIdx : Nat)
-    (result : Constr) (v : Valuation)
-    (h : VeriPB.weakenConstr c varIdx = .ok result)
-    (hsat : c.sat v) : result.sat v := by
-  unfold VeriPB.weakenConstr at h
-  exact findAndRemove_sat c varIdx [] c.terms result v h
-    (by simp; exact hsat)
+/-- Weakening by a variable preserves satisfaction: the removed terms
+contribute at most their coefficient sum, which is subtracted from the
+degree (truncated). -/
+private theorem weakenConstr_sat (c : Constr) (varIdx : Nat) (v : Valuation)
+    (hsat : c.sat v) : (VeriPB.weakenConstr c varIdx).sat v := by
+  simp only [VeriPB.weakenConstr, Constr.sat] at *
+  have h1 : Sat.PB.evalSum v (c.terms.filter fun t => !(t.2.var == varIdx)) +
+      Sat.PB.evalSum v (c.terms.filter fun t => t.2.var == varIdx) =
+      Sat.PB.evalSum v c.terms :=
+    evalSum_filter_add v _ c.terms
+  have h2 := evalSum_le_coeffSumR v (c.terms.filter fun t => t.2.var == varIdx)
+  omega
 
 theorem execPolOne_sound (db : Std.HashMap Nat Constr)
     (original : Array Constr) (stack stack' : List VeriPB.StackElem)
@@ -915,14 +896,10 @@ theorem execPolOne_sound (db : Std.HashMap Nat Constr)
           rename_i nVal _
           split at hexec
           · -- nVal > 0
-            match hweak : VeriPB.weakenConstr c (nVal - 1) with
-            | .ok result =>
-              simp only [hweak] at hexec
-              injection hexec with hexec; subst hexec
-              exact StackSound_cons_constr _ _ _ rest htail
-                fun v hsat => weakenConstr_sat c (nVal - 1) result v
-                  hweak (hc v hsat)
-            | .error _ => simp [hweak] at hexec
+            injection hexec with hexec; subst hexec
+            exact StackSound_cons_constr _ _ _ rest htail
+              fun v hsat => weakenConstr_sat _ (nVal - 1) v
+                (normalize_sat c v (hc v hsat))
           · exact absurd hexec (by simp)
         · exact absurd hexec (by simp)
       · exact absurd hexec (by simp)
