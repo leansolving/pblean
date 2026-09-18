@@ -137,6 +137,8 @@ Independence numbers of Paley graphs, v0.4.0 on an Apple M2 (Lean 4.30.0):
 
 The end-to-end time includes about 0.7 s of Lean startup and, for Paley(101), 0.6 s for compiling the auxiliary definition that `nativeEqTrue` evaluates (the constraint array as a Lean term). The native VeriPB checker verifies the Paley(101) proof in 0.23 s.
 
+The paper reports 200 s for Paley(101) with v0.3.1. That figure was a benchmarking error: the script ran the checker in Lean's IR interpreter instead of the precompiled native code that `lake build` uses. Measured correctly, v0.3.1 took 9.3 s; v0.4.0 brings this to 2.8 s (checker 6.2 s to 1.3 s) through the array-based runtime checker and the byte-level parser. The paper's conclusion that PBLean is about 200x slower than VeriPB should read about 12x end-to-end, or 6x for the checker alone.
+
 ## References
 
 - S. Szeider. *PBLean: Pseudo-Boolean Proof Certificates for Lean 4.* [arXiv:2602.08692](https://arxiv.org/abs/2602.08692), 2026.
