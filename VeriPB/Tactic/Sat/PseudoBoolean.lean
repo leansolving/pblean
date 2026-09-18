@@ -163,9 +163,9 @@ theorem lit_axiom_neg (i : Nat) (v : Valuation) :
 -- Medium soundness: weaken, saturate
 
 /-- **Weakening rule**: removing a term and subtracting its coefficient
-from the degree preserves satisfaction. -/
+from the degree (truncated at 0) preserves satisfaction. -/
 theorem weaken_term_sat (v : Valuation) (pre post : List Term) (a : Nat) (l : Literal)
-    (d : Nat) (hle : a ≤ d)
+    (d : Nat)
     (h : (Constr.mk (pre ++ (a, l) :: post) d).sat v) :
     (Constr.mk (pre ++ post) (d - a)).sat v := by
   simp only [Constr.sat] at *
@@ -174,6 +174,15 @@ theorem weaken_term_sat (v : Valuation) (pre post : List Term) (a : Nat) (l : Li
   simp only [evalSum] at h
   have hlit := mul_evalLit_le a v l
   omega
+
+/-- `evalSum` splits along a filter: the terms rejected by `p` and the terms
+accepted by `p` together sum to the whole. -/
+theorem evalSum_filter_add (v : Valuation) (p : Term → Bool) (ts : List Term) :
+    evalSum v (ts.filter fun t => !p t) + evalSum v (ts.filter p) = evalSum v ts := by
+  induction ts with
+  | nil => simp [evalSum]
+  | cons t rest ih =>
+    cases hp : p t <;> simp [hp, evalSum] <;> omega
 
 /-- **Degree weakening**: lowering the degree preserves satisfaction. -/
 theorem weaken_degree_sat (c : Constr) (d : Nat) (v : Valuation)

@@ -33,6 +33,24 @@ VERIBP_DIR = os.path.dirname(SCRIPT_DIR)
 # ============================================================
 
 
+def dynlib_args():
+    """`--load-dynlib` flag for the precompiled checker library.
+
+    `lake build` passes `libveripb_VeriPBReflect` (the shared library of the
+    `VeriPBReflect` lib) to every module that imports the checker; a plain
+    `lake env lean <file>` does not, and then the checker runs in the IR
+    interpreter (about 20x slower, e.g. 157 s instead of 9 s on Paley(101)
+    with v0.3.1)."""
+    libdir = os.path.join(VERIBP_DIR, ".lake", "build", "lib")
+    for ext in ("dylib", "so"):
+        lib = os.path.join(libdir, f"libveripb_VeriPBReflect.{ext}")
+        if os.path.exists(lib):
+            return [f"--load-dynlib={lib}"]
+    sys.stderr.write("warning: precompiled checker library missing; "
+                     "run `lake build` first (timings will be interpreter speed)\n")
+    return []
+
+
 def run_lean(code, timeout=600):
     """Run Lean code via lake env lean, return (wall_ms, status).
 
@@ -44,7 +62,7 @@ def run_lean(code, timeout=600):
             f.write(code)
         t0 = time.time()
         proc = subprocess.Popen(
-            ["lake", "env", "lean", path],
+            ["lake", "env", "lean"] + dynlib_args() + [path],
             cwd=VERIBP_DIR,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True

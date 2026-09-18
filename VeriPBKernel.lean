@@ -6,9 +6,14 @@ Authors: Stefan Szeider
 -- Kernel (PB proof checking infrastructure)
 import VeriPB.Tactic.Sat.PseudoBoolean
 import VeriPB.Tactic.Sat.FromVeriPB
+import VeriPB.Tactic.Sat.ReflectCheck
+import VeriPB.Tactic.Sat.ReflectFast
 import VeriPB.Tactic.Sat.Reflect
 
 -- Tests (kernel rules + reflection checker)
 import VeriPB.Tactic.Sat.Tests.Basic
 import VeriPB.Tactic.Sat.Tests.Diverse
 import VeriPB.Tactic.Sat.Tests.Reflect
+import VeriPB.Tactic.Sat.Tests.Normalize
+import VeriPB.Tactic.Sat.Tests.Differential
+import VeriPB.Tactic.Sat.Tests.FastConstr

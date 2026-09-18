@@ -7,6 +7,8 @@ import Lean
 import Std
 import VeriPB.Tactic.Sat.PseudoBoolean
 import VeriPB.Tactic.Sat.FromVeriPB
+import VeriPB.Tactic.Sat.ReflectCheck
+import VeriPB.Tactic.Sat.ReflectFast
 
 /-!
 # Reflection-based VeriPB Proof Checking
@@ -23,6 +25,14 @@ This approach scales much better than explicit Expr construction because:
 - The heavy computation runs as compiled Lean code, not kernel reduction
 - Memory usage is bounded by the checker state, not accumulated Expr nodes
 
+The checker components it builds on live in two companion modules:
+`VeriPB.Tactic.Sat.ReflectCheck` (list-based, the definitions the proofs
+reason about) and `VeriPB.Tactic.Sat.ReflectFast` (array-based runtime
+replacement).  The step loop itself stays here, next to its soundness
+proofs.  This module ties the two checkers together with
+`@[implemented_by]`, proves soundness, and provides the `veripb_reflect`
+command.
+
 ## Trust assumptions
 
 Using `native_decide` adds the Lean compiler to the trusted code base.
@@ -32,300 +42,16 @@ This is the same trust model as Lean's built-in `bv_decide` tactic.
 
 * `VeriPB.Reflect.checkProofBool` — Boolean checker for VeriPB proofs
 * `VeriPB.Reflect.checkProof_sound` — Soundness theorem
-* `checkProofBoolFast` — Array-based runtime replacement via `@[implemented_by]`
+* `VeriPB.Reflect.Fast.checkProofBoolFast` — Array-based runtime replacement
+  via `@[implemented_by]`
+* `VeriPB.Reflect.mkFormulaUnsatProof` — Reflection bridge term for
+  external `formulaUnsat` proofs (downstream entry point)
 * `veripb_reflect` — Command using reflection
 -/
 
 namespace VeriPB.Reflect
 
 open Sat.PB
-
--- Re-export key types
-abbrev Constr := Sat.PB.Constr
-abbrev Valuation := Sat.PB.Valuation
-
-/-- Propagation loop iteration limit: `(numVars + 1) * (numHints + 1)`.
-    Each iteration must propagate at least one new assignment or find a
-    conflict, so `numVars * numHints` is a tight bound; the `+1` factors
-    absorb off-by-one edge cases. -/
-private def propagationIterLimit (numVars numHints : Nat) : Nat :=
-  (numVars + 1) * (numHints + 1)
-
-/-! ## Boolean checker
-
-Core checker functions (`execStepsFuel`, `execPolOps`, `combineHintsRec`)
-are total and pure recursive to enable formal verification.
-Helper functions (`pbPropagateBool`, `findConflictHintBool`) use
-`Id.run do` for readability but are not part of the soundness proof.
--/
-
-/-- Check state for the Boolean checker. Uses arrays for efficiency. -/
-structure BoolCheckState where
-  /-- Constraint database: maps ID to constraint -/
-  db : Std.HashMap Nat Constr
-  /-- Original formula constraints (for red coverage verification) -/
-  origConstrs : Array Constr
-  /-- Next available constraint ID -/
-  nextId : Nat
-  /-- Number of variables -/
-  numVars : Nat
-  /-- Expected formula size -/
-  formulaSize : Nat
-  deriving Inhabited
-
-/-- Build HashMap from list with starting index (pure recursive). -/
-private def mkDBRec : List Constr → Nat → Std.HashMap Nat Constr
-  | [], _ => {}
-  | c :: rest, i => (mkDBRec rest (i + 1)).insert i c
-
-/-- Initialize check state from an array of constraints. -/
-def BoolCheckState.fromConstrs (constrs : Array Constr) (numVars : Nat) :
-    BoolCheckState :=
-  { db := mkDBRec constrs.toList 1
-    origConstrs := constrs
-    nextId := constrs.size + 1
-    numVars := numVars
-    formulaSize := constrs.size }
-
-/-! ### Pol RPN execution (pure recursive) -/
-
-/-- Execute a single pol operation on the stack. -/
-def execPolOne (db : Std.HashMap Nat Constr) (stack : List VeriPB.StackElem)
-    (op : VeriPB.PolOp) : Option (List VeriPB.StackElem) :=
-  match op with
-  | .pushId id => match db[id]? with
-    | some c => some (.constr c :: stack)
-    | none => none
-  | .pushNat n => some (.nat n :: stack)
-  | .pushLitAxiom lit => match VeriPB.opbLitToPB lit with
-    | .ok pbLit => some (.constr ⟨[(1, pbLit)], 0⟩ :: stack)
-    | .error _ => none
-  | .add => match stack with
-    | .constr c2 :: .constr c1 :: rest =>
-      some (.constr (VeriPB.addConstrs c1 c2) :: rest)
-    | _ => none
-  | .mul => match stack with
-    | .nat k :: .constr c :: rest =>
-      some (.constr (VeriPB.mulConstr c k) :: rest)
-    | _ => none
-  | .div => match stack with
-    | .nat k :: .constr c :: rest =>
-      if k == 0 then none
-      else some (.constr (VeriPB.divConstr (VeriPB.normalizeConstr c) k) :: rest)
-    | _ => none
-  | .saturate => match stack with
-    | .constr c :: rest =>
-      some (.constr (VeriPB.saturateConstr (VeriPB.normalizeConstr c)) :: rest)
-    | _ => none
-  | .weaken varName => match stack with
-    | .constr c :: rest =>
-      if varName.startsWith "x" then
-        match (varName.drop 1).toString.toNat? with
-        | some n => if n > 0 then
-            match VeriPB.weakenConstr c (n - 1) with
-            | .ok result => some (.constr result :: rest)
-            | .error _ => none
-          else none
-        | none => none
-      else none
-    | _ => none
-
-/-- Execute pol RPN operations on a stack. Pure recursive. -/
-def execPolOps (db : Std.HashMap Nat Constr) :
-    List VeriPB.PolOp → List VeriPB.StackElem → Option (List VeriPB.StackElem)
-  | [], stack => some stack
-  | op :: rest, stack =>
-    match execPolOne db stack op with
-    | some s => execPolOps db rest s
-    | none => none
-
-/-- Execute pol RPN and return result constraint (or none on error). -/
-def execPolRPNBool (ops : List VeriPB.PolOp) (db : Std.HashMap Nat Constr) :
-    Option Constr :=
-  match execPolOps db ops [] with
-  | some [.constr c] => some c
-  | _ => none
-
-/-! ### RUP verification -/
-
-/-- Find a complementary literal pair between accumulator and hint. -/
-def findCompLitPairBool (acc hint : Constr) : Option (Nat × Nat) :=
-  acc.terms.findSome? fun (ca, la) =>
-    hint.terms.findSome? fun (ch, lh) =>
-      if la.var == lh.var && la != lh then some (ca, ch)
-      else none
-
-/-- Evaluate a literal under a partial assignment. -/
-def evalLitPartialBool (asgn : Array (Option Bool)) (l : Sat.PB.Literal) :
-    Option Bool :=
-  match l with
-  | .pos i => if h : i < asgn.size then asgn[i] else none
-  | .neg i => if h : i < asgn.size then asgn[i].map (!·) else none
-
-/-- Result of propagating a single constraint. -/
-inductive PropResultBool where
-  | conflict
-  | propagated (forced : List (Sat.PB.Literal × Bool))
-  | noPropagation
-
-/-- PB unit propagation on a constraint. -/
-def pbPropagateBool (asgn : Array (Option Bool)) (c : Constr) :
-    PropResultBool := Id.run do
-  let mut totalActive : Nat := 0
-  let mut unassigned : List (Nat × Sat.PB.Literal) := []
-  for (a, l) in c.terms do
-    match evalLitPartialBool asgn l with
-    | some false => pure ()
-    | none =>
-      totalActive := totalActive + a
-      unassigned := (a, l) :: unassigned
-    | some true => totalActive := totalActive + a
-  if totalActive < c.degree then return .conflict
-  let slack := totalActive - c.degree
-  let forced := unassigned.filterMap fun (a, l) =>
-    if a > slack then some (l, true) else none
-  if forced.isEmpty then .noPropagation
-  else .propagated forced
-
-/-- Find the conflict hint index via propagation. -/
-def findConflictHintBool (negConstr : Constr) (hints : List VeriPB.RupHint)
-    (db : Std.HashMap Nat Constr) (numVars : Nat) : Option Nat := Id.run do
-  let mut hintArr : Array Constr := #[]
-  for h in hints do
-    match h with
-    | .negC => hintArr := hintArr.push negConstr
-    | .id n => match db[n]? with
-      | some c => hintArr := hintArr.push c
-      | none => return none
-  let mut asgn : Array (Option Bool) := .replicate numVars none
-  let mut conflictIdx : Option Nat := none
-  let mut changed := true
-  let maxIters := propagationIterLimit numVars hintArr.size
-  let hintIdxs := List.range hintArr.size
-  let mut iters := 0
-  while changed && iters < maxIters do
-    iters := iters + 1
-    changed := false
-    for i in hintIdxs do
-      if conflictIdx.isSome then break
-      let hintC := hintArr[i]!
-      match pbPropagateBool asgn hintC with
-      | .conflict => conflictIdx := some i
-      | .propagated forced =>
-        changed := true
-        for (l, val) in forced do
-          if conflictIdx.isSome then break
-          let varIdx := l.var
-          let actualVal := match l with
-            | .pos _ => val
-            | .neg _ => !val
-          if varIdx < asgn.size then
-            match asgn[varIdx]! with
-            | some existing =>
-              if existing != actualVal then
-                conflictIdx := some i
-                break
-            | none => asgn := asgn.set! varIdx (some actualVal)
-      | .noPropagation => pure ()
-  return conflictIdx
-
-/-- Combine hints by adding with complementary literal cancellation.
-    Pure recursive for provability. -/
-def combineHintsRec (acc : Constr) : List Constr → Constr
-  | [] => acc
-  | hintC :: rest =>
-    if acc.isContra then acc
-    else
-      let combined := match findCompLitPairBool acc hintC with
-        | some (ca, ch) =>
-          let accM := if ch == 1 then acc else VeriPB.mulConstr acc ch
-          let hintM := if ca == 1 then hintC else VeriPB.mulConstr hintC ca
-          VeriPB.normalizeConstr (VeriPB.addConstrs accM hintM)
-        | none =>
-          VeriPB.normalizeConstr (VeriPB.addConstrs acc hintC)
-      combineHintsRec combined rest
-
-/-- Resolve a RUP hint to a constraint. -/
-def resolveHint (negConstr : Constr) (db : Std.HashMap Nat Constr)
-    (h : VeriPB.RupHint) : Option Constr :=
-  match h with
-  | .negC => some negConstr
-  | .id n => db[n]?
-
-/-- Extract the conflict constraint and other hints from RUP data.
-    Returns `none` if extraction fails (empty hints, no conflict, etc.). -/
-def verifyRupExtract (negConstr : Constr) (hints : List VeriPB.RupHint)
-    (db : Std.HashMap Nat Constr) (numVars : Nat) :
-    Option (Constr × List Constr) :=
-  if hints.isEmpty then none
-  else
-    let hintsArr := hints.toArray
-    match findConflictHintBool negConstr hints db numVars with
-    | none => none
-    | some conflictIdx =>
-      match resolveHint negConstr db (hintsArr[conflictIdx]!) with
-      | none => none
-      | some conflictC =>
-        let otherHints := (List.range hintsArr.size).filterMap fun i =>
-          if i == conflictIdx then none
-          else resolveHint negConstr db (hintsArr[i]!)
-        some (conflictC, otherHints)
-
-/-- Verify RUP step using propagation + conflict-first combining. -/
-def verifyRupBool (negConstr : Constr) (hints : List VeriPB.RupHint)
-    (db : Std.HashMap Nat Constr) (numVars : Nat) : Bool :=
-  match verifyRupExtract negConstr hints db numVars with
-  | none => false
-  | some (conflictC, otherHints) =>
-    (combineHintsRec (VeriPB.normalizeConstr conflictC)
-      otherHints).isContra
-
-/-! ### Red coverage verification -/
-
-/-- Check if two normalized constraints match (same degree and sorted terms). -/
-private def constrMatchNorm (c1 c2 : Constr) : Bool :=
-  c1.degree == c2.degree && c1.terms.length == c2.terms.length &&
-  -- Compare sorted term lists
-  let sort := fun (ts : List (Nat × Sat.PB.Literal)) =>
-    ts.mergeSort fun a b =>
-      Sat.PB.Literal.var a.2 < Sat.PB.Literal.var b.2 ||
-      (Sat.PB.Literal.var a.2 == Sat.PB.Literal.var b.2 &&
-       match a.2, b.2 with
-       | .pos _, .neg _ => true
-       | _, _ => false)
-  sort c1.terms == sort c2.terms
-
-/-- Check if a constraint (after normalization) is in the database. -/
-private def constrInDB (c : Constr) (db : Std.HashMap Nat Constr) : Bool :=
-  let nc := VeriPB.normalizeConstr c
-  db.toList.any fun (_, dbC) => constrMatchNorm nc (VeriPB.normalizeConstr dbC)
-
-/-- Verify red rule coverage for the red step.
-    1. Must have a '#' goal (for the new constraint C itself).
-    2. Every original constraint with affected variables must have a goal
-       or be auto-satisfied (G|ω is already in the db). Rejects if any
-       affected original constraint was deleted from savedDb.
-    3. Every derived constraint in savedDb with affected variables must
-       have a goal or be auto-satisfied. -/
-def checkRedCoverage (_origConstrs : Array Constr)
-    (subst : List (Nat × Sat.PB.SubstVal))
-    (savedDb : Std.HashMap Nat Constr)
-    (goals : List (String × Array VeriPB.ProofStep × Nat)) : Bool :=
-  -- Must have at least one '#' goal (for C itself)
-  let hasHashGoal := goals.any fun (gid, _, _) => gid.startsWith "#"
-  if !hasHashGoal then false
-  else
-    -- Collect numeric goal IDs
-    let goalIds := goals.filterMap fun (gid, _, _) =>
-      if gid.startsWith "#" then none else gid.toNat?
-    -- Helper: check if an affected constraint is covered
-    let isCovered (id : Nat) (c : Constr) : Bool :=
-      goalIds.contains id ||
-      constrInDB (Sat.PB.applySubstConstr subst c) savedDb
-    -- Check all constraints in savedDb (original and derived)
-    savedDb.toList.all fun (id, c) =>
-      if Sat.PB.termsAffected subst c.terms then isCovered id c
-      else true
 
 /-! ### Step execution (total, fuel-bounded) -/
 
@@ -392,8 +118,7 @@ def execStepsFuel (fuel : Nat) (state : BoolCheckState)
       | .rup constr hints =>
         match VeriPB.opbConstrToPB constr with
         | .ok pbConstr =>
-          if pbConstr.degree > pbConstr.coeffSum then none
-          else if !verifyRupBool pbConstr.negate hints state.db
+          if !verifyRupBool (rupNegate pbConstr) hints state.db
               state.numVars then none
           else
             let newDb := state.db.insert state.nextId
@@ -478,483 +203,8 @@ def execStepsFuel (fuel : Nat) (state : BoolCheckState)
     | none => none
 termination_by (fuel, steps.length)
 
-/-- Check if any step is a valid UNSAT conclusion. -/
-def hasUnsatConclusion (steps : Array VeriPB.ProofStep)
-    (state : BoolCheckState) : Bool :=
-  steps.any fun step => match step with
-    | .conclusion id => match state.db[id]? with
-      | some c => c.isContra
-      | none => false
-    | _ => false
-
-/-- Count total pbc nesting depth for fuel computation. -/
-partial def pbcDepth : List VeriPB.ProofStep → Nat
-  | [] => 0
-  | .pbc _ inner _ :: rest =>
-    max (1 + pbcDepth inner.toList) (pbcDepth rest)
-  | .red _ _ goals :: rest =>
-    let goalDepth := goals.foldl (fun d (_, steps, _) =>
-      max d (1 + pbcDepth steps.toList)) 0
-    max goalDepth (pbcDepth rest)
-  | _ :: rest => pbcDepth rest
-
-/-! ## Array-based fast checker (runtime replacement via @[implemented_by])
-
-All functions below use `Array (Nat × Sat.PB.Literal)` instead of
-`List (Nat × Sat.PB.Literal)` for constraint terms. This avoids
-O(n) cons-cell allocation on every append/map/normalize step.
-The slow `checkProofBool` definition is kept for proofs; the kernel
-type-checker calls `checkProofBoolFast` at runtime.
--/
-
-private structure FConstr where
-  terms : Array (Nat × Sat.PB.Literal)
-  degree : Nat
-  deriving Inhabited
-
-private structure FBoolCheckState where
-  db : Std.HashMap Nat FConstr
-  origConstrs : Array Constr
-  nextId : Nat
-  numVars : Nat
-  formulaSize : Nat
-  deriving Inhabited
-
-private def toFConstr (c : Constr) : FConstr :=
-  ⟨c.terms.toArray, c.degree⟩
-
-private def fromFConstr (c : FConstr) : Constr :=
-  ⟨c.terms.toList, c.degree⟩
-
-private def FConstr.coeffSum (c : FConstr) : Nat :=
-  c.terms.foldl (fun acc (a, _) => acc + a) 0
-
-private def FConstr.isContra (c : FConstr) : Bool :=
-  c.coeffSum < c.degree
-
-private def FConstr.negate (c : FConstr) : FConstr :=
-  let m := c.coeffSum
-  ⟨c.terms.map fun (a, l) => (a, l.negate), m - c.degree + 1⟩
-
-private def FConstr.negateWith (c : FConstr) (cs : Nat) : FConstr :=
-  ⟨c.terms.map fun (a, l) => (a, l.negate), cs - c.degree + 1⟩
-
-private def addFConstrs (c1 c2 : FConstr) : FConstr :=
-  ⟨c1.terms ++ c2.terms, c1.degree + c2.degree⟩
-
-private def mulFConstr (c : FConstr) (k : Nat) : FConstr :=
-  ⟨c.terms.map fun (a, l) => (k * a, l), k * c.degree⟩
-
-private def divFConstr (c : FConstr) (k : Nat) : FConstr :=
-  ⟨c.terms.map fun (a, l) => (Sat.PB.ceilDiv a k, l),
-   Sat.PB.ceilDiv c.degree k⟩
-
-private def saturateFConstr (c : FConstr) : FConstr :=
-  ⟨c.terms.map fun (a, l) => (min a c.degree, l), c.degree⟩
-
-private def weakenFConstr (c : FConstr) (varIdx : Nat) :
-    Option FConstr := Id.run do
-  for i in [:c.terms.size] do
-    let (a, l) := c.terms[i]!
-    if l.var == varIdx then
-      if a ≤ c.degree then
-        let rest := c.terms[:i] ++ c.terms[i+1:]
-        return some ⟨rest, c.degree - a⟩
-      else return none
-  return none
-
--- HashMap-based O(n) normalization for FConstr
-private def normalizeFConstr (c : FConstr) : FConstr :=
-  -- Phase 1: merge like terms into HashMap
-  let merged : Std.HashMap Sat.PB.Literal Nat :=
-    c.terms.foldl (fun m (coeff, lit) =>
-      if coeff == 0 then m
-      else match m[lit]? with
-        | some old => m.insert lit (old + coeff)
-        | none     => m.insert lit coeff) ∅
-  -- Phase 2: collect unique variable indices, sorted for deterministic order
-  let vars : Array Nat :=
-    (merged.fold (fun (s : Std.HashSet Nat) lit _ => s.insert lit.var) ∅).fold
-      (fun (a : Array Nat) v => a.push v) #[]
-  let vars := vars.qsort (· < ·)
-  -- Phase 3: cancel complementary pairs, build result
-  let initAcc : Array (Nat × Sat.PB.Literal) × Nat := (#[], c.degree)
-  let (resultTerms, resultDeg) :=
-    vars.foldl (fun (acc : Array (Nat × Sat.PB.Literal) × Nat) v =>
-      let posLit := Sat.PB.Literal.pos v
-      let negLit := Sat.PB.Literal.neg v
-      let posCoeff := merged[posLit]?.getD 0
-      let negCoeff := merged[negLit]?.getD 0
-      let m := min posCoeff negCoeff
-      let (deg, pc, nc) :=
-        if m > 0 && m ≤ acc.2 then (acc.2 - m, posCoeff - m, negCoeff - m)
-        else (acc.2, posCoeff, negCoeff)
-      let terms := acc.1
-      let terms := if pc > 0 then terms.push (pc, posLit) else terms
-      let terms := if nc > 0 then terms.push (nc, negLit) else terms
-      (terms, deg)) initAcc
-  ⟨resultTerms, resultDeg⟩
-
-/-! ### Fast pol RPN -/
-
-private inductive FStackElem where
-  | constr : FConstr → FStackElem
-  | nat : Nat → FStackElem
-
-private def execFPolOne (db : Std.HashMap Nat FConstr)
-    (stack : List FStackElem) (op : VeriPB.PolOp) :
-    Option (List FStackElem) :=
-  match op with
-  | .pushId id => match db[id]? with
-    | some c => some (.constr c :: stack)
-    | none => none
-  | .pushNat n => some (.nat n :: stack)
-  | .pushLitAxiom lit => match VeriPB.opbLitToPB lit with
-    | .ok pbLit => some (.constr ⟨#[(1, pbLit)], 0⟩ :: stack)
-    | .error _ => none
-  | .add => match stack with
-    | .constr c2 :: .constr c1 :: rest =>
-      some (.constr (addFConstrs c1 c2) :: rest)
-    | _ => none
-  | .mul => match stack with
-    | .nat k :: .constr c :: rest =>
-      some (.constr (mulFConstr c k) :: rest)
-    | _ => none
-  | .div => match stack with
-    | .nat k :: .constr c :: rest =>
-      if k == 0 then none
-      else some (.constr (divFConstr (normalizeFConstr c) k) :: rest)
-    | _ => none
-  | .saturate => match stack with
-    | .constr c :: rest =>
-      some (.constr (saturateFConstr (normalizeFConstr c)) :: rest)
-    | _ => none
-  | .weaken varName => match stack with
-    | .constr c :: rest =>
-      if varName.startsWith "x" then
-        match (varName.drop 1).toString.toNat? with
-        | some n => if n > 0 then
-            match weakenFConstr c (n - 1) with
-            | some result => some (.constr result :: rest)
-            | none => none
-          else none
-        | none => none
-      else none
-    | _ => none
-
-private def execFPolOps (db : Std.HashMap Nat FConstr) :
-    List VeriPB.PolOp → List FStackElem → Option (List FStackElem)
-  | [], stack => some stack
-  | op :: rest, stack =>
-    match execFPolOne db stack op with
-    | some s => execFPolOps db rest s
-    | none => none
-
-private def execFPolRPNBool (ops : List VeriPB.PolOp)
-    (db : Std.HashMap Nat FConstr) : Option FConstr :=
-  match execFPolOps db ops [] with
-  | some [.constr c] => some c
-  | _ => none
-
-/-! ### Fast RUP verification -/
-
-private def findFCompLitPairBool (acc hint : FConstr) :
-    Option (Nat × Nat) := Id.run do
-  for (ca, la) in acc.terms do
-    for (ch, lh) in hint.terms do
-      if la.var == lh.var && la != lh then return some (ca, ch)
-  return none
-
-private def pbFPropagateBool (asgn : Array (Option Bool)) (c : FConstr) :
-    PropResultBool := Id.run do
-  let mut totalActive : Nat := 0
-  let mut unassigned : Array (Nat × Sat.PB.Literal) := #[]
-  for (a, l) in c.terms do
-    match evalLitPartialBool asgn l with
-    | some false => pure ()
-    | none =>
-      totalActive := totalActive + a
-      unassigned := unassigned.push (a, l)
-    | some true => totalActive := totalActive + a
-  if totalActive < c.degree then return .conflict
-  let slack := totalActive - c.degree
-  let mut forced : List (Sat.PB.Literal × Bool) := []
-  for (a, l) in unassigned do
-    if a > slack then forced := (l, true) :: forced
-  if forced.isEmpty then .noPropagation
-  else .propagated forced
-
-private def findFConflictHintBool (negConstr : FConstr)
-    (hints : List VeriPB.RupHint) (db : Std.HashMap Nat FConstr)
-    (numVars : Nat) : Option Nat := Id.run do
-  let mut hintArr : Array FConstr := #[]
-  for h in hints do
-    match h with
-    | .negC => hintArr := hintArr.push negConstr
-    | .id n => match db[n]? with
-      | some c => hintArr := hintArr.push c
-      | none => return none
-  let mut asgn : Array (Option Bool) := .replicate numVars none
-  let mut conflictIdx : Option Nat := none
-  let mut changed := true
-  let maxIters := propagationIterLimit numVars hintArr.size
-  let mut iters := 0
-  while changed && iters < maxIters do
-    iters := iters + 1
-    changed := false
-    for i in [:hintArr.size] do
-      if conflictIdx.isSome then break
-      let hintC := hintArr[i]!
-      match pbFPropagateBool asgn hintC with
-      | .conflict => conflictIdx := some i
-      | .propagated forced =>
-        changed := true
-        for (l, val) in forced do
-          if conflictIdx.isSome then break
-          let varIdx := l.var
-          let actualVal := match l with
-            | .pos _ => val
-            | .neg _ => !val
-          if varIdx < asgn.size then
-            match asgn[varIdx]! with
-            | some existing =>
-              if existing != actualVal then
-                conflictIdx := some i
-                break
-            | none => asgn := asgn.set! varIdx (some actualVal)
-      | .noPropagation => pure ()
-  return conflictIdx
-
-private def combineFHintsRec (acc : FConstr) : List FConstr → FConstr
-  | [] => acc
-  | hintC :: rest =>
-    if acc.isContra then acc
-    else
-      let combined := match findFCompLitPairBool acc hintC with
-        | some (ca, ch) =>
-          let accM := if ch == 1 then acc else mulFConstr acc ch
-          let hintM := if ca == 1 then hintC else mulFConstr hintC ca
-          normalizeFConstr (addFConstrs accM hintM)
-        | none =>
-          normalizeFConstr (addFConstrs acc hintC)
-      combineFHintsRec combined rest
-
-private def resolveFHint (negConstr : FConstr)
-    (db : Std.HashMap Nat FConstr) (h : VeriPB.RupHint) :
-    Option FConstr :=
-  match h with
-  | .negC => some negConstr
-  | .id n => db[n]?
-
-private def verifyFRupExtract (negConstr : FConstr)
-    (hints : List VeriPB.RupHint) (db : Std.HashMap Nat FConstr)
-    (numVars : Nat) : Option (FConstr × List FConstr) :=
-  if hints.isEmpty then none
-  else
-    let hintsArr := hints.toArray
-    match findFConflictHintBool negConstr hints db numVars with
-    | none => none
-    | some conflictIdx =>
-      match resolveFHint negConstr db (hintsArr[conflictIdx]!) with
-      | none => none
-      | some conflictC =>
-        let otherHints := (List.range hintsArr.size).filterMap fun i =>
-          if i == conflictIdx then none
-          else resolveFHint negConstr db (hintsArr[i]!)
-        some (conflictC, otherHints)
-
-private def verifyFRupBool (negConstr : FConstr)
-    (hints : List VeriPB.RupHint) (db : Std.HashMap Nat FConstr)
-    (numVars : Nat) : Bool :=
-  match verifyFRupExtract negConstr hints db numVars with
-  | none => false
-  | some (conflictC, otherHints) =>
-    (combineFHintsRec (normalizeFConstr conflictC) otherHints).isContra
-
-/-! ### Fast step execution -/
-
-private def FBoolCheckState.fromConstrs (constrs : Array Constr)
-    (numVars : Nat) : FBoolCheckState :=
-  { db := constrs.foldl (fun (db, i) c =>
-      (db.insert i (toFConstr c), i + 1)) ({}, 1) |>.1
-    origConstrs := constrs
-    nextId := constrs.size + 1
-    numVars := numVars
-    formulaSize := constrs.size }
-
-/-- Process red proof goals for the fast (Array-based) checker. -/
-private def processFRedGoalsBool
-    (execFn : FBoolCheckState → List VeriPB.ProofStep → Option FBoolCheckState)
-    (origConstrs : Array Constr) (numVars formulaSize : Nat)
-    (subst : List (Nat × Sat.PB.SubstVal)) (pbConstr : Constr)
-    (savedDb redDb : Std.HashMap Nat FConstr)
-    (goals : List (String × Array VeriPB.ProofStep × Nat))
-    (nextId : Nat) : Option Nat :=
-  match goals with
-  | [] => some nextId
-  | (goalId, innerSteps, resultId) :: rest =>
-    let goalConstr? :=
-      if goalId.startsWith "#" then
-        some (toFConstr (Sat.PB.applySubstConstr subst pbConstr))
-      else match goalId.toNat? with
-      | some dbId => match savedDb[dbId]? with
-        | some c => some (toFConstr (Sat.PB.applySubstConstr subst (fromFConstr c)))
-        | none => none
-      | none => none
-    match goalConstr? with
-    | none => none
-    | some goalFc =>
-      if goalFc.degree > goalFc.coeffSum then none
-      else
-      let goalNeg := goalFc.negateWith goalFc.coeffSum
-      let goalDb := redDb.insert nextId goalNeg
-      let subState : FBoolCheckState :=
-        { db := goalDb, origConstrs, nextId := nextId + 1,
-          numVars, formulaSize }
-      match execFn subState innerSteps.toList with
-      | some finalSub =>
-        match finalSub.db[resultId]? with
-        | some c =>
-          if !c.isContra then none
-          else processFRedGoalsBool execFn origConstrs numVars formulaSize
-            subst pbConstr savedDb redDb rest finalSub.nextId
-        | none => none
-      | none => none
-
-private def execFStepsFuel (fuel : Nat) (state : FBoolCheckState)
-    (steps : List VeriPB.ProofStep) : Option FBoolCheckState :=
-  match steps with
-  | [] => some state
-  | step :: rest =>
-    let stepResult : Option FBoolCheckState := match step with
-      | .formulaSize n =>
-        if state.formulaSize != n then none else some state
-      | .pol ops =>
-        match execFPolRPNBool ops state.db with
-        | some result =>
-          let newDb := state.db.insert state.nextId
-            (normalizeFConstr result)
-          some { state with db := newDb, nextId := state.nextId + 1 }
-        | none => none
-      | .rup constr hints =>
-        match VeriPB.opbConstrToPB constr with
-        | .ok pbConstr =>
-          let fc := toFConstr pbConstr
-          let cs := fc.coeffSum
-          if fc.degree > cs then none
-          else if !verifyFRupBool (fc.negateWith cs) hints state.db
-              state.numVars then none
-          else
-            let newDb := state.db.insert state.nextId
-              (normalizeFConstr fc)
-            some { state with db := newDb, nextId := state.nextId + 1 }
-        | .error _ => none
-      | .pbc constr innerSteps resultId =>
-        if innerSteps.any (fun s => match s with
-            | .conclusion _ | .output => true | _ => false) then
-          none
-        else match fuel with
-        | 0 => none
-        | n + 1 =>
-          match VeriPB.opbConstrToPB constr with
-          | .ok pbConstr =>
-            let fc := toFConstr pbConstr
-            let cs := fc.coeffSum
-            if fc.degree > cs then none
-            else
-              let savedDb := state.db
-              let negId := state.nextId
-              let dbWithNeg := state.db.insert negId (fc.negateWith cs)
-              let subState : FBoolCheckState :=
-                { state with db := dbWithNeg, nextId := negId + 1 }
-              match execFStepsFuel n subState innerSteps.toList with
-              | some finalSub =>
-                match finalSub.db[resultId]? with
-                | some c =>
-                  if !c.isContra then none
-                  else
-                    let restoredDb := savedDb.insert finalSub.nextId
-                      (normalizeFConstr fc)
-                    some { state with
-                      db := restoredDb
-                      nextId := finalSub.nextId + 1 }
-                | none => none
-              | none => none
-          | .error _ => none
-      | .red constr substPairs goals =>
-        match fuel with
-        | 0 => none
-        | n + 1 =>
-          match VeriPB.opbConstrToPB constr with
-          | .ok pbConstr =>
-            let fc := toFConstr pbConstr
-            let cs := fc.coeffSum
-            if fc.degree > cs then none
-            else
-              match VeriPB.parseSubstPairs substPairs state.numVars with
-              | .error _ => none
-              | .ok subst =>
-                let savedDb := state.db
-                let negId := state.nextId
-                let redDb := state.db.insert negId (fc.negateWith cs)
-                -- Coverage check needs Constr db, convert from FConstr
-                let constrDb := savedDb.fold (fun (m : Std.HashMap Nat Constr) k v =>
-                  m.insert k (fromFConstr v)) {}
-                if !checkRedCoverage state.origConstrs subst constrDb
-                    goals.toList then none
-                else
-                match processFRedGoalsBool (execFStepsFuel n)
-                    state.origConstrs state.numVars state.formulaSize
-                    subst pbConstr savedDb redDb goals.toList
-                    (negId + 1) with
-                | some finalNextId =>
-                  let restoredDb := savedDb.insert finalNextId
-                    (normalizeFConstr fc)
-                  some { state with
-                    db := restoredDb
-                    nextId := finalNextId + 1 }
-                | none => none
-          | .error _ => none
-      | .deld ids | .delc ids =>
-        some { state with
-          db := ids.foldl (fun db id => db.erase id) state.db }
-      | .output => some state
-      | .conclusion id =>
-        match state.db[id]? with
-        | some c => if c.isContra then some state else none
-        | none => none
-      | .sol _ => some state
-      | .soli _ => some state
-      | .conclusionSat _ => some state
-      | .conclusionBounds _ _ _ _ => some state
-    match stepResult with
-    | some s => execFStepsFuel fuel s rest
-    | none => none
-termination_by (fuel, steps.length)
-
-private def hasFUnsatConclusion (steps : Array VeriPB.ProofStep)
-    (state : FBoolCheckState) : Bool :=
-  steps.any fun step => match step with
-    | .conclusion id => match state.db[id]? with
-      | some c => c.isContra
-      | none => false
-    | _ => false
-
-private def checkProofBoolFast (constrs : Array Constr) (numVars : Nat)
-    (proofStr : String) : Bool :=
-  match VeriPB.parseVeriPBProof proofStr with
-  | .error _ => false
-  | .ok proofData =>
-    let initState := FBoolCheckState.fromConstrs constrs numVars
-    let stepsList := proofData.steps.toList
-    let fuel := pbcDepth stepsList + 1
-    match execFStepsFuel fuel initState stepsList with
-    | some finalState =>
-      hasFUnsatConclusion proofData.steps finalState
-    | none => false
-
 /-- Main Boolean checker: returns true iff proof is valid UNSAT proof. -/
-@[implemented_by checkProofBoolFast]
+@[implemented_by Fast.checkProofBoolFast]
 def checkProofBool (constrs : Array Constr) (numVars : Nat)
     (proofStr : String) : Bool :=
   match VeriPB.parseVeriPBProof proofStr with
@@ -966,34 +216,6 @@ def checkProofBool (constrs : Array Constr) (numVars : Nat)
     | some finalState =>
       hasUnsatConclusion proofData.steps finalState
     | none => false
-
-/-- Timed version for benchmarking (not used in proofs). -/
-def checkProofBoolTimed (constrs : Array Constr) (numVars : Nat)
-    (proofStr : String) : IO Unit := do
-  let t0 ← IO.monoMsNow
-  let parseResult := VeriPB.parseVeriPBProof proofStr
-  let t1 ← IO.monoMsNow
-  match parseResult with
-  | .error e => IO.println s!"Parse error: {e}"
-  | .ok proofData =>
-    IO.println s!"Parse: {t1-t0}ms ({proofData.steps.size} steps)"
-    let initState := BoolCheckState.fromConstrs constrs numVars
-    let fuel := pbcDepth proofData.steps.toList + 1
-    let t2 ← IO.monoMsNow
-    IO.println s!"Init+fuel: {t2-t1}ms (fuel={fuel})"
-    -- Force evaluation by matching AND accessing nextId
-    let result := execStepsFuel fuel initState proofData.steps.toList
-    match result with
-    | some finalState =>
-      -- Force the HashMap by accessing a concrete field
-      let dbSize := finalState.db.size
-      let t3 ← IO.monoMsNow
-      IO.println s!"Execution: {t3-t2}ms (db.size={dbSize})"
-      let ok := hasUnsatConclusion proofData.steps finalState
-      let t4 ← IO.monoMsNow
-      IO.println s!"Conclusion: {t4-t3}ms, result={ok}"
-      IO.println s!"Total: {t4-t0}ms"
-    | none => IO.println "Execution failed"
 
 /-! ## Soundness theorem infrastructure -/
 
@@ -1565,37 +787,18 @@ private theorem StackSound_head_constr (original : Array Constr)
       (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v :=
   h (.constr c) (.head _)
 
-private theorem findAndRemove_sat (c : Constr) (varIdx : Nat)
-    (pre : List Term) (remaining : List Term) (result : Constr)
-    (v : Valuation)
-    (hfind : VeriPB.weakenConstr.findAndRemove c varIdx pre remaining =
-      .ok result)
-    (hsat : Sat.PB.evalSum v (pre.reverse ++ remaining) ≥ c.degree) :
-    result.sat v := by
-  induction remaining generalizing pre with
-  | nil => simp [VeriPB.weakenConstr.findAndRemove] at hfind
-  | cons term rest ih =>
-    obtain ⟨a, l⟩ := term
-    simp only [VeriPB.weakenConstr.findAndRemove] at hfind
-    by_cases hvar : l.var == varIdx
-    · simp only [hvar, ite_true] at hfind
-      by_cases hle : a ≤ c.degree
-      · simp only [hle, ite_true] at hfind
-        injection hfind with hfind; rw [← hfind]
-        exact weaken_term_sat v pre.reverse rest a l c.degree hle hsat
-      · simp [hle] at hfind
-    · simp only [hvar] at hfind
-      apply ih ((a, l) :: pre) hfind
-      rw [List.reverse_cons, List.append_assoc]
-      exact hsat
-
-private theorem weakenConstr_sat (c : Constr) (varIdx : Nat)
-    (result : Constr) (v : Valuation)
-    (h : VeriPB.weakenConstr c varIdx = .ok result)
-    (hsat : c.sat v) : result.sat v := by
-  unfold VeriPB.weakenConstr at h
-  exact findAndRemove_sat c varIdx [] c.terms result v h
-    (by simp; exact hsat)
+/-- Weakening by a variable preserves satisfaction: the removed terms
+contribute at most their coefficient sum, which is subtracted from the
+degree (truncated). -/
+private theorem weakenConstr_sat (c : Constr) (varIdx : Nat) (v : Valuation)
+    (hsat : c.sat v) : (VeriPB.weakenConstr c varIdx).sat v := by
+  simp only [VeriPB.weakenConstr, Constr.sat] at *
+  have h1 : Sat.PB.evalSum v (c.terms.filter fun t => !(t.2.var == varIdx)) +
+      Sat.PB.evalSum v (c.terms.filter fun t => t.2.var == varIdx) =
+      Sat.PB.evalSum v c.terms :=
+    evalSum_filter_add v _ c.terms
+  have h2 := evalSum_le_coeffSumR v (c.terms.filter fun t => t.2.var == varIdx)
+  omega
 
 theorem execPolOne_sound (db : Std.HashMap Nat Constr)
     (original : Array Constr) (stack stack' : List VeriPB.StackElem)
@@ -1692,14 +895,10 @@ theorem execPolOne_sound (db : Std.HashMap Nat Constr)
           rename_i nVal _
           split at hexec
           · -- nVal > 0
-            match hweak : VeriPB.weakenConstr c (nVal - 1) with
-            | .ok result =>
-              simp only [hweak] at hexec
-              injection hexec with hexec; subst hexec
-              exact StackSound_cons_constr _ _ _ rest htail
-                fun v hsat => weakenConstr_sat c (nVal - 1) result v
-                  hweak (hc v hsat)
-            | .error _ => simp [hweak] at hexec
+            injection hexec with hexec; subst hexec
+            exact StackSound_cons_constr _ _ _ rest htail
+              fun v hsat => weakenConstr_sat _ (nVal - 1) v
+                (normalize_sat c v (hc v hsat))
           · exact absurd hexec (by simp)
         · exact absurd hexec (by simp)
       · exact absurd hexec (by simp)
@@ -1860,25 +1059,33 @@ private theorem verifyRupExtract_props (negConstr : Constr)
           · cases hfi
           · exact ⟨hints.toArray[i]!, hfi⟩
 
+/-- A falsified `rup` target satisfies its `rupNegate`. -/
+theorem rupNegate_sat_of_not_sat (c : Constr) (v : Valuation)
+    (h : ¬ c.sat v) : (rupNegate c).sat v := by
+  by_cases hle : (VeriPB.normalizeConstr c).degree ≤ (VeriPB.normalizeConstr c).coeffSum
+  · simp only [rupNegate, hle, if_true]
+    exact negate_sat_of_not_sat _ v hle fun hs => h (normalize_sat_rev c v hs)
+  · simp only [rupNegate, hle, if_false]
+    simp [Constr.sat, Sat.PB.evalSum]
+
 theorem verifyRupBool_implied (negConstr : Constr)
     (hints : List VeriPB.RupHint) (db : Std.HashMap Nat Constr)
     (numVars : Nat) (original : Array Constr) (c : Constr)
-    (hsound : DBSound original db) (hcs : c.degree ≤ c.coeffSum)
+    (hsound : DBSound original db)
     (hrup : verifyRupBool negConstr hints db numVars = true)
-    (hneg : negConstr = c.negate) :
+    (hneg : ∀ v : Valuation, ¬ c.sat v → negConstr.sat v) :
     ∀ v : Valuation,
       (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v := by
   intro v horiginal
   apply Classical.byContradiction; intro hn
-  have hneg_sat : negConstr.sat v := by
-    rw [hneg]; exact negate_sat_of_not_sat c v hcs hn
+  have hneg_sat : negConstr.sat v := hneg v hn
   simp only [verifyRupBool] at hrup
-  match hext : verifyRupExtract negConstr hints db numVars with
+  match hext : verifyRupExtract negConstr (withNegHint hints) db numVars with
   | none => simp [hext] at hrup
   | some (conflictC, otherHints) =>
     simp only [hext] at hrup
     obtain ⟨⟨rh, hres⟩, hother⟩ :=
-      verifyRupExtract_props negConstr hints db numVars
+      verifyRupExtract_props negConstr (withNegHint hints) db numVars
         conflictC otherHints hext
     have hconf := resolveHint_implied negConstr db original rh
       conflictC hsound hres
@@ -2082,30 +1289,26 @@ theorem execStepsFuel_sat_preserve : ∀ (fuel : Nat)
         match hparse : VeriPB.opbConstrToPB constr with
         | .ok pbConstr =>
           simp [hparse] at hsteps
-          by_cases hcs : pbConstr.degree > pbConstr.coeffSum
-          · simp [hcs] at hsteps
-          · simp [hcs] at hsteps
-            by_cases hrup : verifyRupBool pbConstr.negate hints
-                state.db state.numVars = false
-            · simp [hrup] at hsteps
-            · simp [hrup] at hsteps
-              have hcs' : pbConstr.degree ≤ pbConstr.coeffSum :=
-                Nat.le_of_not_lt hcs
-              have hrup' : verifyRupBool pbConstr.negate hints
-                  state.db state.numVars = true := by
-                cases h : verifyRupBool pbConstr.negate hints
-                    state.db state.numVars
-                · exact absurd h hrup
-                · rfl
-              apply ih_rest _ _ hsteps
-              apply DBSat_insert_dbImplied state.db state.nextId
-                (VeriPB.normalizeConstr pbConstr) hsat
-              intro v hdb
-              exact normalize_sat pbConstr v
-                (verifyRupBool_implied pbConstr.negate hints state.db
-                  state.numVars ⟨state.db.toList.map Prod.snd⟩ pbConstr
-                  (DBSound_of_toList state.db) hcs' hrup' rfl v
-                  (toList_sat_of_DBSat state.db v hdb))
+          by_cases hrup : verifyRupBool (rupNegate pbConstr) hints
+              state.db state.numVars = false
+          · simp [hrup] at hsteps
+          · simp [hrup] at hsteps
+            have hrup' : verifyRupBool (rupNegate pbConstr) hints
+                state.db state.numVars = true := by
+              cases h : verifyRupBool (rupNegate pbConstr) hints
+                  state.db state.numVars
+              · exact absurd h hrup
+              · rfl
+            apply ih_rest _ _ hsteps
+            apply DBSat_insert_dbImplied state.db state.nextId
+              (VeriPB.normalizeConstr pbConstr) hsat
+            intro v hdb
+            exact normalize_sat pbConstr v
+              (verifyRupBool_implied (rupNegate pbConstr) hints state.db
+                state.numVars ⟨state.db.toList.map Prod.snd⟩ pbConstr
+                (DBSound_of_toList state.db) hrup'
+                (rupNegate_sat_of_not_sat pbConstr) v
+                (toList_sat_of_DBSat state.db v hdb))
         | .error _ => simp [hparse] at hsteps
       | pbc constr innerSteps resultId =>
         -- Proof by contradiction: inner proof with ¬C derives contradiction
@@ -2406,6 +1609,32 @@ where
       elems := termExpr :: elems
     mkListLit termType elems.reverse
 
+/-- Build a proof of `formulaUnsat constrs` from a VeriPB kernel proof.
+
+`constrsExpr : Array Constr` and `numVarsExpr : Nat` must be closed terms
+(no free variables or metavariables). The proof text is checked by native
+evaluation of `checkProofBool` through `Lean.Meta.nativeEqTrue`, which
+records a per-use axiom `checkProofBool constrs numVars proofStr = true`
+(the same mechanism as `native_decide`); the result is
+`checkProof_sound constrs numVars proofStr ax : formulaUnsat constrs`.
+
+Downstream tools that produce their own `formulaUnsat` theorems (for
+example from an encoding function) should call this instead of building the
+bridge term by hand. `tacName` labels the axiom; `ref?` sets its declaration
+range for `#print axioms`-style tooling. -/
+def mkFormulaUnsatProof (tacName : Name) (constrsExpr numVarsExpr : Expr)
+    (proofStr : String) (ref? : Option Syntax := none) : MetaM Expr := do
+  let constrsExpr ← instantiateMVars constrsExpr
+  let numVarsExpr ← instantiateMVars numVarsExpr
+  let proofStrExpr := mkStrLit proofStr
+  let checkBoolExpr := mkApp3 (mkConst ``checkProofBool)
+    constrsExpr numVarsExpr proofStrExpr
+  match ← Lean.Meta.nativeEqTrue tacName checkBoolExpr (axiomDeclRange? := ref?) with
+  | .success hEqTrue =>
+    return mkApp4 (mkConst ``checkProof_sound)
+      constrsExpr numVarsExpr proofStrExpr hEqTrue
+  | .notTrue => throwError "VeriPB reflection checker rejected the proof"
+
 -- `veripb_reflect` command
 elab "veripb_reflect " n:ident
     ppSpace opbFile:str ppSpace proofFile:str : command => do
@@ -2418,21 +1647,11 @@ elab "veripb_reflect " n:ident
     let (numVars, constrs) ← match VeriPB.parseOPB opbStr with
       | .ok r => pure r
       | .error e => throwError "OPB parse error: {e}"
-    -- Interpreted pre-check removed for performance; native evaluation
-    -- via nativeEqTrue provides the verified check
     let constrsExpr ← mkConstrArrayExpr constrs
     let numVarsExpr := mkRawNatLit numVars
-    let proofStrExpr := mkStrLit proofStr
     let unsatType := mkApp (mkConst ``formulaUnsat) constrsExpr
-    let checkBoolExpr := mkApp3 (mkConst ``checkProofBool)
-      constrsExpr numVarsExpr proofStrExpr
-    -- Native evaluation via a per-use axiom (like native_decide)
-    let hEqTrue ← match ← Lean.Meta.nativeEqTrue `veripb_reflect checkBoolExpr
-        (axiomDeclRange? := (← getRef)) with
-      | .success prf => pure prf
-      | .notTrue => throwError "Reflection checker returned false for {name}"
-    let proof := mkApp4 (mkConst ``checkProof_sound)
-      constrsExpr numVarsExpr proofStrExpr hEqTrue
+    let proof ← mkFormulaUnsatProof `veripb_reflect constrsExpr numVarsExpr
+      proofStr (ref? := some (← getRef))
     addAndCompile <| Declaration.thmDecl {
       name
       levelParams := []
