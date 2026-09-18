@@ -121,6 +121,13 @@ def FConstr.negateWith (c : FConstr) (cs : Nat) : FConstr :=
 def FConstr.negate (c : FConstr) : FConstr :=
   c.negateWith c.coeffSum
 
+/-- Second half of `rupNegateF` (mirrors `VeriPB.Reflect.rupNegate`) on an
+already normalized constraint: negate, or the trivial constraint when the
+target is contradictory on its own. -/
+def rupNegateWith (nf : FConstr) : FConstr :=
+  let cs := nf.coeffSum
+  if nf.degree ≤ cs then nf.negateWith cs else ⟨#[], #[], 0, 0⟩
+
 /-- Concatenation (mirrors `VeriPB.addConstrs`). Two blocks give a two-block
 constraint; anything else loses the structure. -/
 def addFConstrs (c1 c2 : FConstr) : FConstr :=
@@ -247,6 +254,10 @@ def normalizeFConstr (c : FConstr) : FConstr :=
   if c.split == 0 || n == 0 then normalizeGeneralF c
   else if c.split == n then c
   else normalizeTwoBlocks c
+
+/-- Mirrors `VeriPB.Reflect.rupNegate`. -/
+def rupNegateF (c : FConstr) : FConstr :=
+  rupNegateWith (normalizeFConstr c)
 
 /-! ### Pol RPN -/
 
@@ -421,7 +432,7 @@ def verifyFRupExtract (negConstr : FConstr)
 def verifyFRupBool (negConstr : FConstr)
     (hints : List VeriPB.RupHint) (db : Std.HashMap Nat FConstr)
     (numVars : Nat) : Bool :=
-  match verifyFRupExtract negConstr hints db numVars with
+  match verifyFRupExtract negConstr (withNegHint hints) db numVars with
   | none => false
   | some (conflictC, otherHints) =>
     (combineFHintsRec (normalizeFConstr conflictC) otherHints).isContra
@@ -495,9 +506,7 @@ def execFStepsFuel (fuel : Nat) (state : FBoolCheckState)
         match VeriPB.opbConstrToPB constr with
         | .ok pbConstr =>
           let fc := toFConstr pbConstr
-          let cs := fc.coeffSum
-          if fc.degree > cs then none
-          else if !verifyFRupBool (fc.negateWith cs) hints state.db
+          if !verifyFRupBool (rupNegateF fc) hints state.db
               state.numVars then none
           else
             let newDb := state.db.insert state.nextId

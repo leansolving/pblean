@@ -257,10 +257,26 @@ def verifyRupExtract (negConstr : Constr) (hints : List VeriPB.RupHint)
           else resolveHint negConstr db (hintsArr[i]!)
         some (conflictC, otherHints)
 
+/-- Negation of a `rup` target, as VeriPB propagates over it: the target is
+normalized first (so complementary pairs and repeated literals do not
+weaken propagation); a target whose degree exceeds its coefficient sum is
+unsatisfiable on its own, and its negation is the trivial constraint
+`>= 0`. -/
+def rupNegate (c : Constr) : Constr :=
+  let nc := VeriPB.normalizeConstr c
+  if nc.degree ≤ nc.coeffSum then nc.negate else ⟨[], 0⟩
+
+/-- VeriPB always has the negated target in the database during a `rup`
+check; the `~` hint only fixes its position in the propagation order. When
+absent, propagate it first. -/
+def withNegHint (hints : List VeriPB.RupHint) : List VeriPB.RupHint :=
+  if hints.any (fun h => match h with | .negC => true | .id _ => false) then hints
+  else .negC :: hints
+
 /-- Verify RUP step using propagation + conflict-first combining. -/
 def verifyRupBool (negConstr : Constr) (hints : List VeriPB.RupHint)
     (db : Std.HashMap Nat Constr) (numVars : Nat) : Bool :=
-  match verifyRupExtract negConstr hints db numVars with
+  match verifyRupExtract negConstr (withNegHint hints) db numVars with
   | none => false
   | some (conflictC, otherHints) =>
     (combineHintsRec (VeriPB.normalizeConstr conflictC)

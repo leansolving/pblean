@@ -26,6 +26,14 @@ veripb_reflect weaken_cases_reflect
   "VeriPB/Tactic/Sat/Tests/data/weaken_cases.opb"
   "VeriPB/Tactic/Sat/Tests/data/weaken_cases_kernel.pbp"
 
+-- rup semantics (VeriPB-checked proof): the target is normalized before
+-- negation (complementary pair in the target), and a target with degree
+-- above its coefficient sum (`rup >= 1`) is checked with the trivial
+-- negation.
+veripb_reflect rup_cases_reflect
+  "VeriPB/Tactic/Sat/Tests/data/rup_cases.opb"
+  "VeriPB/Tactic/Sat/Tests/data/rup_cases_kernel.pbp"
+
 -- Red subproof test: pigeon-hole variant with redundance-based strengthening.
 -- Uses red/dom with explicit subproof (proofgoal #1 and proofgoal 1).
 -- Tests: red rule, substitution parsing, goal verification, auto-satisfaction.

@@ -118,8 +118,7 @@ def execStepsFuel (fuel : Nat) (state : BoolCheckState)
       | .rup constr hints =>
         match VeriPB.opbConstrToPB constr with
         | .ok pbConstr =>
-          if pbConstr.degree > pbConstr.coeffSum then none
-          else if !verifyRupBool pbConstr.negate hints state.db
+          if !verifyRupBool (rupNegate pbConstr) hints state.db
               state.numVars then none
           else
             let newDb := state.db.insert state.nextId
@@ -1060,25 +1059,33 @@ private theorem verifyRupExtract_props (negConstr : Constr)
           · cases hfi
           · exact ⟨hints.toArray[i]!, hfi⟩
 
+/-- A falsified `rup` target satisfies its `rupNegate`. -/
+theorem rupNegate_sat_of_not_sat (c : Constr) (v : Valuation)
+    (h : ¬ c.sat v) : (rupNegate c).sat v := by
+  by_cases hle : (VeriPB.normalizeConstr c).degree ≤ (VeriPB.normalizeConstr c).coeffSum
+  · simp only [rupNegate, hle, if_true]
+    exact negate_sat_of_not_sat _ v hle fun hs => h (normalize_sat_rev c v hs)
+  · simp only [rupNegate, hle, if_false]
+    simp [Constr.sat, Sat.PB.evalSum]
+
 theorem verifyRupBool_implied (negConstr : Constr)
     (hints : List VeriPB.RupHint) (db : Std.HashMap Nat Constr)
     (numVars : Nat) (original : Array Constr) (c : Constr)
-    (hsound : DBSound original db) (hcs : c.degree ≤ c.coeffSum)
+    (hsound : DBSound original db)
     (hrup : verifyRupBool negConstr hints db numVars = true)
-    (hneg : negConstr = c.negate) :
+    (hneg : ∀ v : Valuation, ¬ c.sat v → negConstr.sat v) :
     ∀ v : Valuation,
       (∀ c' ∈ original.toList, Constr.sat c' v) → Constr.sat c v := by
   intro v horiginal
   apply Classical.byContradiction; intro hn
-  have hneg_sat : negConstr.sat v := by
-    rw [hneg]; exact negate_sat_of_not_sat c v hcs hn
+  have hneg_sat : negConstr.sat v := hneg v hn
   simp only [verifyRupBool] at hrup
-  match hext : verifyRupExtract negConstr hints db numVars with
+  match hext : verifyRupExtract negConstr (withNegHint hints) db numVars with
   | none => simp [hext] at hrup
   | some (conflictC, otherHints) =>
     simp only [hext] at hrup
     obtain ⟨⟨rh, hres⟩, hother⟩ :=
-      verifyRupExtract_props negConstr hints db numVars
+      verifyRupExtract_props negConstr (withNegHint hints) db numVars
         conflictC otherHints hext
     have hconf := resolveHint_implied negConstr db original rh
       conflictC hsound hres
@@ -1282,30 +1289,26 @@ theorem execStepsFuel_sat_preserve : ∀ (fuel : Nat)
         match hparse : VeriPB.opbConstrToPB constr with
         | .ok pbConstr =>
           simp [hparse] at hsteps
-          by_cases hcs : pbConstr.degree > pbConstr.coeffSum
-          · simp [hcs] at hsteps
-          · simp [hcs] at hsteps
-            by_cases hrup : verifyRupBool pbConstr.negate hints
-                state.db state.numVars = false
-            · simp [hrup] at hsteps
-            · simp [hrup] at hsteps
-              have hcs' : pbConstr.degree ≤ pbConstr.coeffSum :=
-                Nat.le_of_not_lt hcs
-              have hrup' : verifyRupBool pbConstr.negate hints
-                  state.db state.numVars = true := by
-                cases h : verifyRupBool pbConstr.negate hints
-                    state.db state.numVars
-                · exact absurd h hrup
-                · rfl
-              apply ih_rest _ _ hsteps
-              apply DBSat_insert_dbImplied state.db state.nextId
-                (VeriPB.normalizeConstr pbConstr) hsat
-              intro v hdb
-              exact normalize_sat pbConstr v
-                (verifyRupBool_implied pbConstr.negate hints state.db
-                  state.numVars ⟨state.db.toList.map Prod.snd⟩ pbConstr
-                  (DBSound_of_toList state.db) hcs' hrup' rfl v
-                  (toList_sat_of_DBSat state.db v hdb))
+          by_cases hrup : verifyRupBool (rupNegate pbConstr) hints
+              state.db state.numVars = false
+          · simp [hrup] at hsteps
+          · simp [hrup] at hsteps
+            have hrup' : verifyRupBool (rupNegate pbConstr) hints
+                state.db state.numVars = true := by
+              cases h : verifyRupBool (rupNegate pbConstr) hints
+                  state.db state.numVars
+              · exact absurd h hrup
+              · rfl
+            apply ih_rest _ _ hsteps
+            apply DBSat_insert_dbImplied state.db state.nextId
+              (VeriPB.normalizeConstr pbConstr) hsat
+            intro v hdb
+            exact normalize_sat pbConstr v
+              (verifyRupBool_implied (rupNegate pbConstr) hints state.db
+                state.numVars ⟨state.db.toList.map Prod.snd⟩ pbConstr
+                (DBSound_of_toList state.db) hrup'
+                (rupNegate_sat_of_not_sat pbConstr) v
+                (toList_sat_of_DBSat state.db v hdb))
         | .error _ => simp [hparse] at hsteps
       | pbc constr innerSteps resultId =>
         -- Proof by contradiction: inner proof with ¬C derives contradiction

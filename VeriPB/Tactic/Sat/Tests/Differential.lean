@@ -117,5 +117,5 @@ open VeriPB.Tests.Differential in
 #eval show IO Unit from do
   let d := "VeriPB/Tactic/Sat/Tests/data/"
   for n in ["php21", "red_subproof", "red_swap", "red_const", "red_neglit", "dom_basic",
-      "weaken_cases"] do
+      "weaken_cases", "rup_cases"] do
     runOne n (d ++ n ++ ".opb") (d ++ n ++ "_kernel.pbp")
