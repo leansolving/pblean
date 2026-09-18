@@ -83,31 +83,60 @@ def parseNat : ParseM Nat := do
   | some n => return n
   | none => throw s!"expected natural number, got '{tok}'"
 
-/-- Tokenize a line: split on whitespace, separate semicolons.
-    Returns tokens from a single line. -/
-private def tokenizeLine (line : String) : Array String :=
-  let line := line.replace "\t" " "
-  let withSemis := line.replace ";" " ; "
-  let parts := withSemis.splitOn " "
-  (parts.filter (· != "")).toArray
+/-! ### Tokenizer
 
-/-- Check if a line is a comment (starts with % or c). -/
-private def isComment (line : String) : Bool :=
-  let trimmed := line.trimAsciiStart.toString
-  trimmed.startsWith "%" || trimmed.startsWith "c " || trimmed.startsWith "c\t"
-    || trimmed == "c"
+Byte-level scanner over the UTF-8 encoding of the input. Tokens are maximal
+runs of bytes other than space, tab, CR, LF and `;`; a `;` is always a token
+of its own. A line whose first non-blank byte is `%`, or is `c` followed by a
+blank or the end of the line, is a comment and is skipped. All separators
+are ASCII, so they never occur inside a multi-byte UTF-8 sequence; token
+boundaries are therefore character boundaries and every extracted token is a
+valid UTF-8 string. -/
 
-/-- Tokenize a string: split on whitespace, filter empty tokens,
-    strip comments (lines starting with % or c).
-    Uses push-based accumulation for O(n) performance. -/
+/-- Byte `i` of `s`'s UTF-8 encoding (`0` if out of range). -/
+@[inline] private def byteAt (s : String) (i : Nat) : UInt8 :=
+  if h : i < s.utf8ByteSize then
+    s.getUTF8Byte ⟨i⟩ (by simpa [String.Pos.Raw.lt_iff] using h)
+  else 0
+
+@[inline] private def isBlankByte (b : UInt8) : Bool :=
+  b == 32 || b == 9 || b == 13
+
+@[inline] private def isSepByte (b : UInt8) : Bool :=
+  isBlankByte b || b == 10 || b == 59
+
+/-- Tokenize a string: split on blanks, separate semicolons, drop comment
+    lines (starting with `%` or `c`). -/
 def tokenize (s : String) : Array String := Id.run do
-  let lines := s.splitOn "\n"
-  let mut result : Array String := #[]
-  for line in lines do
-    if !isComment line then
-      for tok in tokenizeLine line do
-        result := result.push tok
-  return result
+  let n := s.utf8ByteSize
+  let mut toks : Array String := Array.mkEmpty (n / 3)
+  let mut i := 0
+  while i < n do
+    -- line start: skip blanks, detect comment lines
+    let mut j := i
+    while j < n && isBlankByte (byteAt s j) do j := j + 1
+    let b := byteAt s j
+    -- 37 = '%', 99 = 'c'
+    let isComment := j < n && (b == 37 ||
+      (b == 99 && (j + 1 ≥ n || isBlankByte (byteAt s (j + 1)) || byteAt s (j + 1) == 10)))
+    let mut k := j
+    if isComment then
+      while k < n && byteAt s k != 10 do k := k + 1
+    else
+      while k < n do
+        let c := byteAt s k
+        if c == 10 then break
+        else if isBlankByte c then k := k + 1
+        else if c == 59 then
+          toks := toks.push ";"
+          k := k + 1
+        else
+          let start := k
+          k := k + 1
+          while k < n && !isSepByte (byteAt s k) do k := k + 1
+          toks := toks.push (String.Pos.Raw.extract s ⟨start⟩ ⟨k⟩)
+    i := k + 1
+  return toks
 
 -- Parsed CNF types
 
@@ -367,7 +396,8 @@ def parseOPBConstr : ParseM OPBConstr := do
 
 /-- Parse the RPN operations for a `pol` step.
     Tokens are consumed until `;` is reached.
-    In VeriPB RPN, `*` and `d` consume an integer operand from the stack.
+    In VeriPB RPN, `*` and `d` consume an integer operand from the stack,
+    and `w` consumes the variable that precedes it (`x3 w`).
     Numbers that immediately precede `*` or `d` are pushed as raw integers;
     all other numbers are pushed as constraint IDs.
     We use lookahead: if the next token after a number is `*` or `d`,
@@ -385,8 +415,11 @@ def parsePolOps : ParseM (List PolOp) := do
     else if tok == "d" then
       ops := .div :: ops
     else if tok == "w" then
-      let varTok ← next
-      ops := .weaken varTok :: ops
+      -- VeriPB syntax: the variable precedes `w` (`pol 1 x3 w ;`); it was
+      -- read as a literal-axiom push, which `w` now consumes.
+      match ops with
+      | .pushLitAxiom (.pos varName) :: rest => ops := .weaken varName :: rest
+      | _ => throw "weakening: expected a variable before 'w'"
     else if isVarToken tok then
       match parseOPBLit tok with
       | .ok lit => ops := .pushLitAxiom lit :: ops
@@ -712,38 +745,179 @@ def findLikeTermIdx (terms : List Sat.PB.Term) : Option (Nat × Nat) :=
     (2 fuel per pair), plus zeros and like-term merges. 4 * length + 1 is safe. -/
 def normFuel (nTerms : Nat) : Nat := 4 * nTerms + 1
 
--- HashMap-based O(n) normalization used at runtime via @[implemented_by].
--- Soundness proofs type-check against the slow definition below.
+-- Exact array-based simulation of `normalizeConstr` (used at runtime via
+-- @[implemented_by], and by the fast reflection checker in ReflectFast.lean).
+-- Literal codes: `2*v` for `x_v`, `2*v+1` for `¬x_v`.
+
+/-- General exact simulation of `normalizeConstr.go` on arrays with the same
+priorities (drop first zero; cancel the first complementary pair whose
+`min ≤ degree`; merge the first like-term pair) and O(n²) scans. Only used
+by `normalizeArrays` when its one-pass fast path meets a cancellation that
+is blocked by the degree guard (which can happen only for trivially
+satisfied constraints) or when the literal codes are too sparse for the
+scratch arrays; also called directly by `Tests/Normalize.lean`. -/
+def normalizeArraysGeneral (coeffs lits : Array Nat) (degree : Nat) :
+    Array Nat × Array Nat × Nat := Id.run do
+  let mut cs := coeffs
+  let mut ls := lits
+  let mut deg := degree
+  let mut fuel := 4 * cs.size + 1
+  while fuel > 0 do
+    fuel := fuel - 1
+    let n := cs.size
+    match cs.findIdx? (· == 0) with
+    | some idx =>
+      cs := cs.eraseIdxIfInBounds idx
+      ls := ls.eraseIdxIfInBounds idx
+    | none =>
+      let mut found : Option (Nat × Nat) := none
+      let mut i := 0
+      while i < n && found.isNone do
+        let comp := ls[i]! ^^^ 1
+        let mut j := i + 1
+        while j < n && ls[j]! != comp do j := j + 1
+        if j < n then
+          if min cs[i]! cs[j]! ≤ deg then found := some (i, j)
+        i := i + 1
+      match found with
+      | some (pi, pj) =>
+        let m := min cs[pi]! cs[pj]!
+        cs := cs.set! pi (cs[pi]! - m)
+        cs := cs.set! pj (cs[pj]! - m)
+        deg := deg - m
+      | none =>
+        let mut foundL : Option (Nat × Nat) := none
+        let mut i2 := 0
+        while i2 < n && foundL.isNone do
+          let l := ls[i2]!
+          let mut j := i2 + 1
+          while j < n && ls[j]! != l do j := j + 1
+          if j < n then foundL := some (i2, j)
+          i2 := i2 + 1
+        match foundL with
+        | some (qi, qj) =>
+          cs := cs.set! qi (cs[qi]! + cs[qj]!)
+          cs := cs.eraseIdxIfInBounds qj
+          ls := ls.eraseIdxIfInBounds qj
+        | none => fuel := 0
+  return (cs, ls, deg)
+
+/-- Exact simulation of `normalizeConstr` on parallel arrays (coefficients,
+literal codes), in O(n + maxLit) time where `maxLit` is the largest literal
+code. Returns the normalized arrays and degree, in the same term order as
+the verified definition, and a flag that is `true` iff the one-pass fast
+path completed, in which case the result is a *block* (no zero
+coefficient, no repeated literal, no complementary pair).
+
+Phase A drops zero coefficients. Phase B replays the verified cancellation
+process (for position `i`, the first later complement `j`; cancel
+`min` if `min ≤ degree`) in one forward pass. As long as no cancellation
+has been blocked by the degree guard, a cancellation at `i` cannot create
+a complementary pair for an earlier position, so the verified restart from
+position 0 is equivalent to re-examining `i`. When a blocked pair is met,
+`normalizeArraysGeneral` continues from the current state. Phase C merges
+like terms into their first occurrence, which is what the verified loop does
+once no cancellable pair remains. When the literal codes are sparse
+relative to the term count (`maxLit + 2 > n² + 8`), the O(n²) general
+algorithm is used directly instead of allocating the scratch arrays.
+Property-tested against a verbatim copy of `normalizeConstr`
+(`Tests/Normalize.lean`). -/
+def normalizeArraysCore (coeffs lits : Array Nat) (degree : Nat) :
+    Array Nat × Array Nat × Nat × Bool := Id.run do
+  let n0 := coeffs.size
+  -- Phase A: drop zeros, find the largest literal code
+  let mut cs : Array Nat := Array.mkEmpty n0
+  let mut ls : Array Nat := Array.mkEmpty n0
+  let mut maxLit := 0
+  for k in [:n0] do
+    let a := coeffs[k]!
+    if a != 0 then
+      let l := lits[k]!
+      cs := cs.push a
+      ls := ls.push l
+      if l > maxLit then maxLit := l
+  let n := cs.size
+  let L := maxLit + 2
+  if L > n * n + 8 then
+    let (cs', ls', d') := normalizeArraysGeneral cs ls degree
+    return (cs', ls', d', false)
+  -- Occurrence chains: head[l] = first position holding literal l,
+  -- nextSame[p] = next position holding the same literal; n = none.
+  let mut head : Array Nat := Array.replicate L n
+  let mut nextSame : Array Nat := Array.replicate n n
+  for k in [:n] do
+    let p := n - 1 - k
+    let l := ls[p]!
+    nextSame := nextSame.set! p head[l]!
+    head := head.set! l p
+  -- Phase B: sequential cancellation, one forward pass
+  let mut deg := degree
+  let mut i := 0
+  let mut blocked := false
+  while i < n && !blocked do
+    let a := cs[i]!
+    if a == 0 then
+      i := i + 1
+    else
+      let comp := ls[i]! ^^^ 1
+      -- first live occurrence of the complement after i; positions before i
+      -- and dead positions can be skipped permanently since i only grows
+      let mut j := head[comp]!
+      while j < n && (j < i || cs[j]! == 0) do
+        j := nextSame[j]!
+      head := head.set! comp j
+      if j ≥ n then
+        i := i + 1
+      else
+        let b := cs[j]!
+        let m := min a b
+        if m ≤ deg then
+          cs := cs.set! i (a - m)
+          cs := cs.set! j (b - m)
+          deg := deg - m
+        else
+          blocked := true
+  if blocked then
+    let (cs', ls', d') := normalizeArraysGeneral cs ls deg
+    return (cs', ls', d', false)
+  -- Phase C: merge like terms into their first occurrence
+  let mut slot : Array Nat := Array.replicate L n
+  let mut outC : Array Nat := Array.mkEmpty n
+  let mut outL : Array Nat := Array.mkEmpty n
+  for p in [:n] do
+    let a := cs[p]!
+    if a != 0 then
+      let l := ls[p]!
+      let s := slot[l]!
+      if s == n then
+        slot := slot.set! l outC.size
+        outC := outC.push a
+        outL := outL.push l
+      else
+        outC := outC.set! s (outC[s]! + a)
+  return (outC, outL, deg, true)
+
+/-- `normalizeArraysCore` without the block flag. -/
+def normalizeArrays (coeffs lits : Array Nat) (degree : Nat) :
+    Array Nat × Array Nat × Nat :=
+  let (cs, ls, d, _) := normalizeArraysCore coeffs lits degree
+  (cs, ls, d)
+
+/-- Literal code used by `normalizeArrays`: `2*v` positive, `2*v+1` negative. -/
+@[inline] def litCode : Sat.PB.Literal → Nat
+  | .pos v => 2 * v
+  | .neg v => 2 * v + 1
+
+/-- Inverse of `litCode`. -/
+@[inline] def litOfCode (l : Nat) : Sat.PB.Literal :=
+  if l % 2 == 0 then .pos (l / 2) else .neg (l / 2)
+
+-- Runtime implementation of `normalizeConstr` (exact, see `normalizeArrays`).
 private def normalizeConstrFast (c : Sat.PB.Constr) : Sat.PB.Constr :=
-  -- Phase 1: merge like terms into HashMap (literal → accumulated coefficient)
-  let merged : Std.HashMap Sat.PB.Literal Nat :=
-    c.terms.foldl (fun m (coeff, lit) =>
-      if coeff == 0 then m
-      else match m[lit]? with
-        | some old => m.insert lit (old + coeff)
-        | none     => m.insert lit coeff) ∅
-  -- Phase 2: collect unique variable indices, sorted for deterministic order
-  let vars : Array Nat :=
-    (merged.fold (fun (s : Std.HashSet Nat) lit _ => s.insert lit.var) ∅).fold
-      (fun (a : Array Nat) v => a.push v) #[]
-  let vars := vars.qsort (· < ·)
-  -- Phase 3: cancel complementary pairs, build result
-  let initAcc : List Sat.PB.Term × Nat := ([], c.degree)
-  let (resultTerms, resultDeg) :=
-    vars.foldl (fun (acc : List Sat.PB.Term × Nat) v =>
-      let posLit := Sat.PB.Literal.pos v
-      let negLit := Sat.PB.Literal.neg v
-      let posCoeff := merged[posLit]?.getD 0
-      let negCoeff := merged[negLit]?.getD 0
-      let m := min posCoeff negCoeff
-      let (deg, pc, nc) :=
-        if m > 0 && m ≤ acc.2 then (acc.2 - m, posCoeff - m, negCoeff - m)
-        else (acc.2, posCoeff, negCoeff)
-      let terms := acc.1
-      let terms := if pc > 0 then (pc, posLit) :: terms else terms
-      let terms := if nc > 0 then (nc, negLit) :: terms else terms
-      (terms, deg)) initAcc
-  ⟨resultTerms, resultDeg⟩
+  let ts := c.terms.toArray
+  let (cs, ls, d) := normalizeArrays (ts.map (·.1)) (ts.map (litCode ·.2)) c.degree
+  let terms := (List.range cs.size).map fun i => (cs[i]!, litOfCode ls[i]!)
+  ⟨terms, d⟩
 
 /-- Normalize a PB constraint: remove zeros, cancel complementary pairs (with
     `min a b ≤ degree` guard matching Expr-level `buildNormalization`), merge like terms.
@@ -2334,15 +2508,17 @@ def fromVeriPBDirect (constrs : Array Sat.PB.Constr) (numVars : Nat)
 
 -- OPB file parsing for native PB instances
 
-/-- Parse term pairs from OPB token list (coeff var coeff var ...). -/
+/-- Parse `coeff var` pairs. A negative coefficient `-a·l` is stored as
+`a·¬l` and contributes `a` to the returned degree adjustment
+(`-a·l ≡ a·¬l - a`). Returns terms, max variable seen, degree adjustment. -/
 private def parseOPBTerms : List String → Nat →
-    Except String (List Sat.PB.Term × Nat)
-  | [], maxVar => .ok ([], maxVar)
-  | [_], mv => .ok ([], mv) -- odd token count, ignore trailing
+    Except String (List Sat.PB.Term × Nat × Nat)
+  | [], maxVar => .ok ([], maxVar, 0)
+  | [_], mv => .ok ([], mv, 0) -- odd token count, ignore trailing
   | coeffStr :: varStr :: rest, maxVar => do
-    let coeff ← match (coeffStr.replace "+" "").toNat? with
-      | some c => .ok c
-      | none => .error s!"OPB parse: bad coeff '{coeffStr}'"
+    let coeffI ← match parseCoeffInt coeffStr with
+      | .ok c => .ok c
+      | .error _ => .error s!"OPB parse: bad coeff '{coeffStr}'"
     let (neg, varName) := if varStr.startsWith "~" then
       (true, (varStr.drop 1).toString)
     else (false, varStr)
@@ -2352,12 +2528,18 @@ private def parseOPBTerms : List String → Nat →
       | none => .error s!"OPB parse: bad var '{varStr}'"
     let varIdx := varNum - 1
     let mv := if varNum > maxVar then varNum else maxVar
+    let (coeff, neg, adj) :=
+      if coeffI ≥ 0 then (coeffI.toNat, neg, 0)
+      else ((-coeffI).toNat, !neg, (-coeffI).toNat)
     let lit := if neg then Sat.PB.Literal.neg varIdx
                else Sat.PB.Literal.pos varIdx
-    let (restTerms, mv') ← parseOPBTerms rest mv
-    .ok ((coeff, lit) :: restTerms, mv')
+    let (restTerms, mv', adj') ← parseOPBTerms rest mv
+    .ok ((coeff, lit) :: restTerms, mv', adj + adj')
 
-/-- Parse one OPB constraint line. Returns constraint and max var seen. -/
+/-- Parse one OPB constraint line. Returns constraint and max var seen.
+A negative right-hand side is clamped to `0` after the adjustment for
+negative coefficients (a constraint `Σ ≥ d` with `d ≤ 0` over a
+nonnegative sum is equivalent to `Σ ≥ 0`). -/
 private def parseOPBLine (line : String) :
     Except String (Sat.PB.Constr × Nat) := do
   let parts := line.splitOn ";"
@@ -2368,12 +2550,12 @@ private def parseOPBLine (line : String) :
   else
     let lhs := (geqParts[0]!).trimAscii.toString
     let rhs := (geqParts[1]!).trimAscii.toString
-    let degree ← match rhs.toNat? with
-      | some d => .ok d
-      | none => .error s!"OPB parse: bad degree '{rhs}'"
+    let degreeI ← match parseCoeffInt rhs with
+      | .ok d => .ok d
+      | .error _ => .error s!"OPB parse: bad degree '{rhs}'"
     let tokens := lhs.splitOn " " |>.filter (!·.isEmpty)
-    let (terms, maxVar) ← parseOPBTerms tokens 0
-    .ok (⟨terms, degree⟩, maxVar)
+    let (terms, maxVar, adj) ← parseOPBTerms tokens 0
+    .ok (⟨terms, (degreeI + adj).toNat⟩, maxVar)
 
 /-- Parse an objective line (min: or max:) into a constraint with degree 0.
     The constraint represents the objective function sum. -/

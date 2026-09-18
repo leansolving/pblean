@@ -14,14 +14,20 @@ Three-layer design mirroring LRAT:
 | Layer | File | Description |
 |-------|------|-------------|
 | Kernel | `VeriPB/Tactic/Sat/PseudoBoolean.lean` | PB constraint types, evaluation, soundness lemmas |
-| Metaprogram | `VeriPB/Tactic/Sat/FromVeriPB.lean` | Parser, checker, `Expr`-level proof construction |
-| Reflection | `VeriPB/Tactic/Sat/Reflect.lean` | `checkProofBool` + native evaluation via per-use axioms |
+| Metaprogram | `VeriPB/Tactic/Sat/FromVeriPB.lean` | Parser, normalization, `Expr`-level proof construction |
+| Reflection | `VeriPB/Tactic/Sat/ReflectCheck.lean` | Verified checker definitions (pol, RUP, red coverage) |
+| Reflection | `VeriPB/Tactic/Sat/ReflectFast.lean` | Runtime implementation of the checker (`@[implemented_by]`) |
+| Reflection | `VeriPB/Tactic/Sat/Reflect.lean` | `checkProofBool`, soundness proof, `veripb_reflect`, `mkFormulaUnsatProof` |
 
-Verification uses reflection: a Boolean checker with a proved soundness theorem, executed as compiled native code via `native_decide` (same trade-off as `bv_decide`).
+Verification uses reflection: a Boolean checker with a proved soundness theorem, executed as compiled native code via `native_decide` (same trade-off as `bv_decide`). The verified checker is written over lists for provability; at runtime `@[implemented_by]` swaps in an array-based implementation that must be extensionally equal to it. That equality is tested, not proved: `Tests/Normalize.lean` and `Tests/FastConstr.lean` compare the runtime operations against verbatim copies of the verified definitions on random inputs, and `Tests/Differential.lean` (and `applications/difftest.lean` for the large proofs) runs both checkers side by side and requires identical constraint databases after every proof step.
+
+Downstream projects that produce `formulaUnsat` theorems from their own encodings can call `VeriPB.Reflect.mkFormulaUnsatProof` to build the reflection bridge term instead of assembling it by hand.
 
 ## Supported VeriPB rules
 
-`pol` (polynomial arithmetic), `rup` (reverse unit propagation), `pbc`/`subproof`/`qed` (proof by contradiction), `red`/`dom` (redundance and dominance-based strengthening), `deld`/`delc` (deletion), `sol`/`soli` (solution), `f` (formula size), `output`, `conclusion UNSAT/SAT/BOUNDS`.
+`pol` (polynomial arithmetic, including `x w` weakening), `rup` (reverse unit propagation), `pbc`/`subproof`/`qed` (proof by contradiction), `red`/`dom` (redundance and dominance-based strengthening), `deld`/`delc` (deletion), `sol`/`soli` (solution), `f` (formula size), `output`, `conclusion UNSAT/SAT/BOUNDS`.
+
+Known completeness gaps relative to VeriPB's checker (PBLean rejects, VeriPB accepts; never the other way round): input constraints are used as written rather than normalized, so RUP propagation over an input constraint with a repeated variable is weaker; `rup C : hints` is rejected when the degree of `C` exceeds its coefficient sum (the empty contradiction `rup >= 1`); and weakening acts on the unnormalized operand and removes only the first term of the variable. Proofs elaborated by VeriPB from RoundingSat logs do not hit these cases.
 
 ## Application modules
 
@@ -113,12 +119,23 @@ The checker modules are precompiled to native code (`precompileModules`, like `b
 
 ## Benchmarks
 
-`applications/benchmark.py` measures verification times for all showcase theorems.
+`applications/benchmark.py` measures end-to-end verification times (one `veripb_reflect` command per instance, in a fresh `lean` process) for all showcase theorems; `applications/timing.lean` times the checker alone.
 ```
 python3 applications/benchmark.py           # Lean verification times
 python3 applications/benchmark.py --full    # Also re-solve + re-elaborate
 ```
-The `--full` mode requires [RoundingSat](https://gitlab.com/MIAOresearch/software/roundingsat) and [VeriPB](https://gitlab.com/MIAOresearch/software/VeriPB) in PATH.
+The `--full` mode requires [RoundingSat](https://gitlab.com/MIAOresearch/software/roundingsat) and [VeriPB](https://gitlab.com/MIAOresearch/software/VeriPB) in PATH. Both scripts load the precompiled checker libraries; a plain `lake env lean` run does not, and then the checker executes in Lean's IR interpreter, about 20x slower.
+
+Independence numbers of Paley graphs, v0.4.0 on an Apple M2 (Lean 4.30.0):
+
+| p | proof lines | `checkProofBool` | of which parsing | `veripb_reflect` end-to-end |
+|---|---|---|---|---|
+| 53 | 1,848 | 28 ms | 8 ms | 0.97 s |
+| 73 | 9,808 | 176 ms | 45 ms | 1.29 s |
+| 89 | 36,795 | 787 ms | 174 ms | 2.06 s |
+| 101 | 62,924 | 1.33 s | 0.29 s | 2.83 s |
+
+The end-to-end time includes about 0.7 s of Lean startup and, for Paley(101), 0.6 s for compiling the auxiliary definition that `nativeEqTrue` evaluates (the constraint array as a Lean term). The native VeriPB checker verifies the Paley(101) proof in 0.23 s.
 
 ## References
 

@@ -64,7 +64,7 @@ veripb_proof weaken_inline
 -3 0"
   "pseudo-Boolean proof version 3.0
 f 6;
-pol 1 2 + 3 + w x3 4 2 * + 5 2 * +;
+pol 1 2 + 3 + x3 w 4 2 * + 5 2 * +;
 output NONE ;
 conclusion UNSAT : 7;
 end pseudo-Boolean proof;"
